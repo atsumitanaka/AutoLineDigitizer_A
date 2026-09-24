@@ -781,7 +781,7 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         # Show axis calibration results
         if axis_config is not None:
             with axis_placeholder.container():
-                with st.expander("Axis Calibration (Auto-detected)", expanded=True):
+                with st.expander("Axis Calibration (Auto-detected)", expanded=False):
                     col_x, col_y = st.columns(2)
                     with col_x:
                         st.markdown("**X-axis:**")
@@ -1062,14 +1062,26 @@ def vlm_kmds_tab():
 
 
 def main():
-    st.title("📈 AutoLineDigitizer")
+    # Keep the whole layout inside one viewport height on typical laptop
+    # screens: shrink header padding, cap chart images at ~55vh, tighten
+    # the sidebar, and let the main block use the full width.
     st.markdown("""
-    Extract chart line data from images or full PDFs.
-    Output is compatible with **[StarryDigitizer](https://starrydigitizer.vercel.app/)** and **[WebPlotDigitizer](https://apps.automeris.io/wpd4/)**.
+    <style>
+      .main .block-container {padding-top: 1rem; padding-bottom: 1rem; max-width: 100%;}
+      [data-testid="stImage"] img {max-height: 55vh; width: auto; margin: 0 auto; display: block;}
+      [data-testid="stSidebar"] {min-width: 260px; max-width: 300px;}
+      div[data-testid="stExpander"] summary {padding: 0.25rem 0.5rem;}
+      h1 {font-size: 1.6rem !important; margin: 0.2rem 0 0.4rem 0 !important;}
+      h2 {font-size: 1.25rem !important; margin: 0.4rem 0 !important;}
+      h3 {font-size: 1.05rem !important; margin: 0.3rem 0 !important;}
+      .stMarkdown p {margin-bottom: 0.35rem;}
+    </style>
+    """, unsafe_allow_html=True)
 
-    **[LineFormer Paper (ICDAR 2023)](https://arxiv.org/abs/2305.01837)** |
-    **[ChartDete Paper (ICDAR 2023)](https://arxiv.org/abs/2305.04151)**
-    """)
+    st.title("📈 AutoLineDigitizer")
+    st.caption("Chart line data extraction — output compatible with "
+               "[StarryDigitizer](https://starrydigitizer.vercel.app/) and "
+               "[WebPlotDigitizer](https://apps.automeris.io/wpd4/).")
 
     config = _render_sidebar()
     infer_module, chartdete_module = _load_models(config)
