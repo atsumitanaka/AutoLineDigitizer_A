@@ -34,9 +34,17 @@ import hashlib
 import copy
 import json
 import io
+import base64
 import zipfile
 import tarfile
 from datetime import datetime
+
+try:
+    import plotly.graph_objects as go
+    from streamlit_plotly_events import plotly_events
+    PLOTLY_EVENTS_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    PLOTLY_EVENTS_AVAILABLE = False
 
 # Page config
 st.set_page_config(
@@ -768,6 +776,107 @@ def _get_input_image(key_prefix="single"):
     return None, None
 
 
+def _render_visual_editor(img, edited_series, axis_config, selected_idx,
+                          ss_key, img_key, palette):
+    """Interactive point editor: chart image as plotly background, click to
+    add/delete points on the selected line. Requires streamlit-plotly-events."""
+    if not PLOTLY_EVENTS_AVAILABLE:
+        st.info("Visual editor requires `plotly` + `streamlit-plotly-events` "
+                "(both installed in this env — reload if you don't see it).")
+        return
+
+    H, W = img.shape[:2]
+
+    st.markdown("**Visual editor** — click the chart to add/delete points on Line "
+                f"**{selected_idx + 1}**.")
+    mode_col, undo_col = st.columns([3, 1])
+    with mode_col:
+        mode = st.radio(
+            "Click mode",
+            ["👁 View only", "➕ Add point", "❌ Delete nearest point"],
+            horizontal=True, key=f"vismode_{img_key}_{selected_idx}",
+        )
+    with undo_col:
+        st.write("")
+        if st.button("↩︎ Undo last visual edit",
+                     key=f"vis_undo_{img_key}_{selected_idx}",
+                     disabled=f"vis_undo_stack_{img_key}_{selected_idx}"
+                              not in st.session_state):
+            stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+            if st.session_state.get(stack_key):
+                prev = st.session_state[stack_key].pop()
+                st.session_state[ss_key][selected_idx]["points"] = prev
+                st.rerun()
+
+    # Encode image as data URL for plotly background.
+    _ok, buf = cv2.imencode(".png", img)
+    if not _ok:
+        st.error("Could not encode image for the plotly editor.")
+        return
+    img_b64 = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode()
+
+    pts = edited_series[selected_idx]["points"]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    line_color = "rgb({},{},{})".format(*palette[selected_idx % len(palette)][::-1])
+
+    fig = go.Figure()
+    fig.add_layout_image(
+        source=img_b64, xref="x", yref="y",
+        x=0, y=0, sizex=W, sizey=H,
+        sizing="stretch", opacity=1.0, layer="below",
+    )
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="markers+lines",
+        marker=dict(size=10, color=line_color,
+                    line=dict(color="black", width=1)),
+        line=dict(color=line_color, width=1.5),
+        hovertemplate="pixel (%{x:.0f}, %{y:.0f})<extra></extra>",
+        name=f"Line {selected_idx+1}",
+    ))
+    fig.update_xaxes(range=[0, W], visible=False, constrain="domain")
+    fig.update_yaxes(range=[H, 0], visible=False, scaleanchor="x", scaleratio=1)
+    # Compact layout — height matches other charts (55vh ≈ 500px).
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=520,
+        showlegend=False,
+        dragmode=False,
+    )
+
+    click_event = mode != "👁 View only"
+    events = plotly_events(
+        fig,
+        click_event=click_event,
+        override_height=520,
+        key=f"vis_editor_{img_key}_{selected_idx}",
+    )
+
+    if events and click_event:
+        cx = float(events[0]["x"])
+        cy = float(events[0]["y"])
+        stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+        st.session_state.setdefault(stack_key, [])
+        st.session_state[stack_key].append(copy.deepcopy(pts))
+        if len(st.session_state[stack_key]) > 20:
+            st.session_state[stack_key] = st.session_state[stack_key][-20:]
+
+        if mode.startswith("➕"):
+            # Insert in x-sorted position so lines stay ordered.
+            new_pts = list(pts) + [[int(round(cx)), int(round(cy))]]
+            new_pts.sort(key=lambda p: p[0])
+            st.session_state[ss_key][selected_idx]["points"] = new_pts
+            st.rerun()
+        elif mode.startswith("❌") and pts:
+            # Find nearest point in pixel space and remove it.
+            arr = np.array(pts, dtype=float)
+            d2 = (arr[:, 0] - cx) ** 2 + (arr[:, 1] - cy) ** 2
+            i = int(np.argmin(d2))
+            new_pts = [p for j, p in enumerate(pts) if j != i]
+            st.session_state[ss_key][selected_idx]["points"] = new_pts
+            st.rerun()
+
+
 def _render_single_image_pipeline(img, name, infer_module, chartdete_module, config):
     """Existing single-image workflow, refactored to accept a preloaded image."""
     show_visualization = config["show_visualization"]
@@ -880,12 +989,56 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         elif auto_axis:
             axis_placeholder.warning("Could not auto-detect axis calibration. Manual calibration needed in WPD/StarryDigitizer.")
 
+        # ---- ✦ Claude assistance ----
+        api_key = (st.session_state.get("vlm_api_key", "")
+                   or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+        with st.expander("✦ Claude assistance (axis names, legend labels)",
+                         expanded=False):
+            if not api_key:
+                st.caption("Set ANTHROPIC_API_KEY in the Claude + KMDS tab "
+                           "(or as an env var) to unlock these buttons.")
+            axis_props_key = f"axis_props_{img_bytes_key}"
+            legend_key = f"legend_names_{img_bytes_key}"
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✦ Read axis names + units",
+                             disabled=not api_key,
+                             key=f"vlm_axes_{img_bytes_key}"):
+                    with st.spinner("Claude reading axis properties…"):
+                        try:
+                            from vlm_verifier import VLMVerifier
+                            v = VLMVerifier(api_key=api_key)
+                            props = v.read_axis_properties(img)
+                            st.session_state[axis_props_key] = props
+                        except Exception as e:
+                            st.error(f"Claude axis read failed: {e}")
+                if axis_props_key in st.session_state:
+                    st.write(st.session_state[axis_props_key])
+            with c2:
+                if st.button("✦ Label curves from legend",
+                             disabled=not api_key,
+                             key=f"vlm_legend_{img_bytes_key}"):
+                    with st.spinner("Claude matching curves to legend entries…"):
+                        try:
+                            from vlm_verifier import VLMVerifier
+                            v = VLMVerifier(api_key=api_key)
+                            names = v.label_lines_by_legend(img, edited_series)
+                            st.session_state[legend_key] = names
+                        except Exception as e:
+                            st.error(f"Claude legend labeling failed: {e}")
+                if legend_key in st.session_state:
+                    for i, nm in enumerate(st.session_state[legend_key]):
+                        st.write(f"Line {i+1}: **{nm}**")
+
         # ---- Per-curve inspection & editing ----
         st.subheader("Curves")
-        curve_labels = ["All curves"] + [
-            f"Line {i+1} ({len(s['points'])} pts)"
-            for i, s in enumerate(edited_series)
-        ]
+        legend_names = st.session_state.get(f"legend_names_{img_bytes_key}", [])
+        curve_labels = ["All curves"]
+        for i, s in enumerate(edited_series):
+            nm = (legend_names[i] if i < len(legend_names) and legend_names[i]
+                  else None)
+            label = f"Line {i+1}" + (f" — {nm}" if nm else "") + f" ({len(s['points'])} pts)"
+            curve_labels.append(label)
         sel = st.selectbox(
             "Show", curve_labels, index=0,
             key=f"curve_sel_{img_bytes_key}",
@@ -917,9 +1070,22 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
                                   use_container_width=True)
 
-        # XY table editor for the selected single curve.
+        # Visual editor + XY table for the selected single curve.
         if sel != "All curves":
             idx = curve_labels.index(sel) - 1
+
+            # Rebuild the color palette so the visual editor matches the
+            # numbered chart above.
+            import line_utils
+            palette = list(line_utils.get_distinct_colors(max(1, len(edited_series))))
+
+            with st.expander("🎯 Visual editor (click to add / delete points)",
+                             expanded=True):
+                _render_visual_editor(
+                    img, edited_series, axis_config, idx,
+                    ss_key, img_bytes_key, palette,
+                )
+
             pts_px = edited_series[idx]["points"]
             if axis_config is not None:
                 rows = [_pixel_to_data(p[0], p[1], axis_config) for p in pts_px]
@@ -1236,17 +1402,137 @@ def starrydata_tab():
 
 
 def vlm_kmds_tab():
-    """Tab 5: Claude curation + KMDS record editing (skeleton)."""
-    st.markdown("Claude-assisted axis reading, legend naming, and KMDS record editing.")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    """Tab 5: Claude API key management + KMDS vocabulary lookup + record viewer."""
+    st.markdown("Claude-assisted curation and KMDS canonical-term matching.")
+
+    # --- Anthropic API key ---
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     st.text_input(
-        "ANTHROPIC_API_KEY (set via env or paste here for this session)",
-        value=api_key, type="password", key="vlm_api_key",
-        help="Not stored — env var wins if both set.",
+        "ANTHROPIC_API_KEY (also read from env var)",
+        value=st.session_state.get("vlm_api_key", "") or env_key,
+        type="password", key="vlm_api_key",
+        help="Session-only. Env var wins if both are set. "
+             "The Single Image tab's ✦ Claude buttons read this value.",
     )
-    st.info("VLM + KMDS wiring is in progress — the backend modules "
-            "(vlm_verifier, vlm_extract, kmds_parallel, kmds_editor, kmds_vocab) "
-            "all import cleanly, so hooking them into this tab is the next step.")
+    active_key = (st.session_state.get("vlm_api_key") or env_key).strip()
+    st.caption(("🟢 Key is active — Claude buttons in other tabs are enabled."
+                if active_key else
+                "⚪ No key set — Claude buttons remain disabled."))
+
+    st.divider()
+
+    # --- KMDS vocabulary matcher ---
+    st.subheader("KMDS vocabulary lookup")
+    try:
+        import kmds_vocab
+        vocab_ok = kmds_vocab.available()
+    except Exception as e:
+        st.error(f"kmds_vocab unavailable: {e}")
+        vocab_ok = False
+
+    if vocab_ok:
+        q = st.text_input("Look up a property name",
+                          placeholder="e.g. Seebeck coefficient, "
+                                      "Discharge capacity, Voltage",
+                          key="kmds_vocab_query")
+        if q.strip():
+            match = kmds_vocab.match(q.strip())
+            if match:
+                is_ext = kmds_vocab.is_extension(match)
+                unit = kmds_vocab.unit_of(match) or "—"
+                icon = "🔵 extension" if is_ext else "✅ official"
+                st.success(f"**{match}** ({icon}) · default unit: `{unit}`")
+            else:
+                st.warning(f"'{q}' is not in the KMDS vocabulary. "
+                           "It would be created as an extension term on first use.")
+    else:
+        st.info("KMDS vocabulary not loaded (kmds_v15.2.4_nullable.json missing?).")
+
+    st.divider()
+
+    # --- KMDS record viewer ---
+    st.subheader("KMDS record viewer / editor")
+    st.caption("Upload a `<paper>_kmds/paper.json` (or any KMDS record JSON) "
+               "to inspect and edit as a flat table. Save the edited JSON back "
+               "with the download button.")
+    rec_file = st.file_uploader("Upload paper.json", type=["json"],
+                                key="kmds_rec_upload")
+    if rec_file is not None:
+        try:
+            record = json.loads(rec_file.read().decode("utf-8"))
+        except Exception as e:
+            st.error(f"Failed to parse JSON: {e}")
+            return
+        try:
+            from kmds_editor import flatten_record, apply_text_edits
+            rows = flatten_record(record)
+            df = pd.DataFrame(
+                [{"path": ".".join(str(x) for x in r["path"]),
+                  "value": r.get("text_value", "")}
+                 for r in rows]
+            )
+            edited = st.data_editor(
+                df, use_container_width=True, num_rows="fixed",
+                key="kmds_rec_editor",
+                column_config={"path": st.column_config.TextColumn(disabled=True)},
+            )
+            if st.button("Apply edits → Download updated JSON",
+                         key="kmds_apply"):
+                try:
+                    new_record = copy.deepcopy(record)
+                    edit_rows = []
+                    for r, (_, row) in zip(rows, edited.iterrows()):
+                        edit_rows.append({**r, "text_value": row["value"]})
+                    apply_text_edits(new_record, edit_rows)
+                    st.download_button(
+                        "⬇️ Download updated paper.json",
+                        data=json.dumps(new_record, indent=2,
+                                        ensure_ascii=False).encode("utf-8"),
+                        file_name=f"edited_{rec_file.name}",
+                        mime="application/json",
+                        key="kmds_dl",
+                    )
+                    st.success("Edits applied. Click the download button above.")
+                except Exception as e:
+                    st.error(f"apply_text_edits failed: {e}")
+        except Exception as e:
+            st.error(f"kmds_editor failed: {e}")
+
+    st.divider()
+
+    # --- Extract KMDS from PDF (heavy — uses Claude Sonnet) ---
+    with st.expander("Extract a fresh KMDS record from a PDF (heavy — uses Claude)"):
+        st.caption("Runs kmds_parallel.extract_kmds_parallel() on the uploaded "
+                   "PDF: bibliography, samples, measurements, all parallel Claude "
+                   "calls. Requires ANTHROPIC_API_KEY and a few minutes.")
+        pdf_up = st.file_uploader("PDF", type=["pdf"], key="kmds_extract_pdf")
+        if pdf_up is not None and active_key:
+            if st.button("Extract KMDS (this will take 1-3 min)",
+                         key="kmds_run"):
+                try:
+                    import tempfile, kmds_parallel
+                    with tempfile.NamedTemporaryFile(suffix=".pdf",
+                                                    delete=False) as tmp:
+                        tmp.write(pdf_up.getvalue()); pdf_path = tmp.name
+                    with tempfile.TemporaryDirectory() as out_dir:
+                        with st.spinner("Claude parallel extraction…"):
+                            os.environ["ANTHROPIC_API_KEY"] = active_key
+                            rec = kmds_parallel.extract_kmds_parallel(
+                                pdf_path, output_dir=out_dir,
+                            )
+                        st.success("Extraction done.")
+                        st.download_button(
+                            "⬇️ Download paper.json",
+                            data=json.dumps(rec, indent=2,
+                                            ensure_ascii=False).encode("utf-8"),
+                            file_name=f"{os.path.splitext(pdf_up.name)[0]}_kmds.json",
+                            mime="application/json",
+                        )
+                        with st.expander("Preview record"):
+                            st.json(rec)
+                except Exception as e:
+                    st.error(f"KMDS extraction failed: {e}")
+
     with st.expander("Backend module status"):
         for m in ("vlm_verifier", "vlm_extract", "vlm_screener",
                   "kmds_parallel", "kmds_editor", "kmds_vocab", "legend_mapper"):
