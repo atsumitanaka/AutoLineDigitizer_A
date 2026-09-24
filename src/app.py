@@ -1062,19 +1062,41 @@ def vlm_kmds_tab():
 
 
 def main():
-    # Keep the whole layout inside one viewport height on typical laptop
-    # screens: shrink header padding, cap chart images at ~55vh, tighten
-    # the sidebar, and let the main block use the full width.
+    # Kill horizontal overflow and keep the layout inside one viewport.
+    # Report from Tanaka: window was horizontally scrollable, meaning
+    # content was wider than the viewport — usually an oversized image,
+    # a wide JSON code block, or Streamlit's default page max-width
+    # interacting with wide download-button rows.
     st.markdown("""
     <style>
-      .main .block-container {padding-top: 1rem; padding-bottom: 1rem; max-width: 100%;}
-      [data-testid="stImage"] img {max-height: 55vh; width: auto; margin: 0 auto; display: block;}
-      [data-testid="stSidebar"] {min-width: 260px; max-width: 300px;}
+      html, body {overflow-x: hidden;}
+      .main .block-container {
+        padding-top: 0.6rem; padding-bottom: 0.6rem;
+        padding-left: 1rem; padding-right: 1rem;
+        max-width: 100%;
+      }
+      [data-testid="stAppViewContainer"] {overflow-x: hidden;}
+      [data-testid="stMain"]              {overflow-x: hidden;}
+      [data-testid="stImage"]             {overflow: hidden;}
+      [data-testid="stImage"] img {
+        max-height: 55vh;
+        max-width: 100%;
+        width: auto;
+        height: auto;
+        object-fit: contain;
+        margin: 0 auto;
+        display: block;
+      }
+      [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
+      /* Long JSON lines were the other source of horizontal scroll. */
+      pre, code {white-space: pre-wrap !important; word-break: break-word;}
       div[data-testid="stExpander"] summary {padding: 0.25rem 0.5rem;}
-      h1 {font-size: 1.6rem !important; margin: 0.2rem 0 0.4rem 0 !important;}
-      h2 {font-size: 1.25rem !important; margin: 0.4rem 0 !important;}
-      h3 {font-size: 1.05rem !important; margin: 0.3rem 0 !important;}
-      .stMarkdown p {margin-bottom: 0.35rem;}
+      h1 {font-size: 1.4rem !important; margin: 0.2rem 0 0.3rem 0 !important;}
+      h2 {font-size: 1.15rem !important; margin: 0.3rem 0 !important;}
+      h3 {font-size: 1rem !important;    margin: 0.25rem 0 !important;}
+      .stMarkdown p {margin-bottom: 0.3rem;}
+      /* Compact download-button row so 3 buttons never wrap past the fold. */
+      [data-testid="stDownloadButton"] button {white-space: nowrap;}
     </style>
     """, unsafe_allow_html=True)
 
