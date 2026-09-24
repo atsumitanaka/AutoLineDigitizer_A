@@ -193,7 +193,8 @@ def extract_lines(infer_module, img, downsample_mode, fixed_step, max_points):
     return data_series, line_dataseries
 
 
-def draw_points_on_image(img, data_series, axis_config=None, show_calibration=True):
+def draw_points_on_image(img, data_series, axis_config=None,
+                         show_calibration=True, show_calibration_values=False):
     """Draw extracted points as symbols on image, with optional axis calibration markers."""
     import line_utils
 
@@ -222,23 +223,23 @@ def draw_points_on_image(img, data_series, axis_config=None, show_calibration=Tr
     # Draw axis calibration points if available
     if axis_config is not None and show_calibration:
         H, W = result_img.shape[:2]
-        # Scale everything with image size so a 1300px chart doesn't get a
-        # 40-point font that swamps the tick labels.
-        s = max(0.35, min(W, H) / 1600.0)
+        # Scale visual weight with image size but never so thin that dashes
+        # disappear at web-display resolution.
+        s = max(0.5, min(W, H) / 1200.0)
         calib_color = (255, 0, 255)
         outline_color = (0, 0, 0)
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.45 * s
-        thickness = max(1, int(round(1.2 * s)))
-        marker_r_outer = max(4, int(round(7 * s)))
-        marker_r_inner = max(3, int(round(5 * s)))
-        cross_arm = max(2, int(round(3 * s)))
-        label_pad = max(1, int(round(2 * s)))
+        line_thick = max(2, int(round(2 * s)))    # axis dashes: keep visible
+        text_thick = max(1, int(round(1.2 * s)))  # text remains lighter
+        marker_r_outer = max(7, int(round(9 * s)))
+        marker_r_inner = max(5, int(round(7 * s)))
+        cross_arm = max(3, int(round(4 * s)))
+        label_pad = max(2, int(round(3 * s)))
 
         def draw_text_with_bg(img, text, pos, color):
-            (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, text_thick)
             x, y = pos
-            # Clamp to image so labels never render off-canvas.
             x = max(label_pad, min(W - text_w - label_pad, x))
             y = max(text_h + label_pad, min(H - baseline - label_pad, y))
             cv2.rectangle(img, (x - label_pad, y - text_h - label_pad),
@@ -247,17 +248,20 @@ def draw_points_on_image(img, data_series, axis_config=None, show_calibration=Tr
             cv2.rectangle(img, (x - label_pad, y - text_h - label_pad),
                           (x + text_w + label_pad, y + baseline + label_pad),
                           outline_color, 1)
-            cv2.putText(img, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+            cv2.putText(img, text, (x, y), font, font_scale, color, text_thick, cv2.LINE_AA)
 
         def draw_calib_point(img, x, y, color, label, side):
-            cv2.circle(img, (x, y), marker_r_outer, outline_color, 1)
+            # Marker only — the value labels obscure the printed tick numbers
+            # in the corners of typical scientific plots. Turn on
+            # show_calibration_values if you need them burned into the image.
+            cv2.circle(img, (x, y), marker_r_outer, outline_color, 2)
             cv2.circle(img, (x, y), marker_r_inner, color, -1)
-            cv2.line(img, (x - cross_arm, y), (x + cross_arm, y), outline_color, 1)
-            cv2.line(img, (x, y - cross_arm), (x, y + cross_arm), outline_color, 1)
-            # Place the label OUTSIDE the plot area on the correct side of the
-            # figure so it never sits on top of the printed tick label.
-            (tw, th), _bl = cv2.getTextSize(label, font, font_scale, thickness)
-            gap = max(4, int(round(6 * s)))
+            cv2.line(img, (x - cross_arm, y), (x + cross_arm, y), outline_color, 2)
+            cv2.line(img, (x, y - cross_arm), (x, y + cross_arm), outline_color, 2)
+            if not show_calibration_values:
+                return
+            (tw, th), _bl = cv2.getTextSize(label, font, font_scale, text_thick)
+            gap = max(6, int(round(8 * s)))
             if side == "left":
                 lx = max(label_pad, x - marker_r_outer - gap - tw)
                 ly = y + th // 2
@@ -277,9 +281,9 @@ def draw_points_on_image(img, data_series, axis_config=None, show_calibration=Tr
         y1_x, y1_y = int(axis_config['y1_px']), int(axis_config['y1_py'])
         y2_x, y2_y = int(axis_config['y2_px']), int(axis_config['y2_py'])
 
-        # Dashed calibration axes
-        dash_length = max(4, int(round(6 * s)))
-        gap_length = max(2, int(round(3 * s)))
+        # Dashed calibration axes — kept visible at any scale.
+        dash_length = max(8, int(round(10 * s)))
+        gap_length = max(4, int(round(5 * s)))
         for (ax1, ay1, ax2, ay2) in [(x1_x, x1_y, x2_x, x2_y),
                                      (y1_x, y1_y, y2_x, y2_y)]:
             dx, dy = ax2 - ax1, ay2 - ay1
@@ -290,7 +294,7 @@ def draw_points_on_image(img, data_series, axis_config=None, show_calibration=Tr
                 ei = min(i + dash_length, dist)
                 ex = int(ax1 + dx * ei / dist)
                 ey = int(ay1 + dy * ei / dist)
-                cv2.line(result_img, (sx, sy), (ex, ey), calib_color, thickness)
+                cv2.line(result_img, (sx, sy), (ex, ey), calib_color, line_thick)
 
         # Compact labels (drop the "X1="/"Y1=" prefix — the position tells you which)
         def _fmt(v):
@@ -600,7 +604,15 @@ def _render_sidebar():
     show_calibration = st.sidebar.checkbox(
         "Show calibration overlay on chart", value=True,
         help="Draws the four calibration points + dashed axes on the result "
-             "image. Turn OFF if the labels obscure the printed tick values.",
+             "image so you can see where the auto-detection landed.",
+    )
+    show_calibration_values = st.sidebar.checkbox(
+        "Burn calibration values into image", value=False,
+        help="Also writes the detected values (e.g. '3.0', '1200') next to "
+             "each marker. Off by default because the values are already "
+             "printed on the axis — turn ON to include them in the exported "
+             "visualization.",
+        disabled=not show_calibration,
     )
 
     st.sidebar.subheader("Line Sorting")
@@ -632,6 +644,7 @@ def _render_sidebar():
         show_visualization=show_visualization,
         auto_axis=auto_axis,
         show_calibration=show_calibration,
+        show_calibration_values=show_calibration_values,
         sort_mode=sort_mode,
         downsample_mode=downsample_mode,
         fixed_step=fixed_step,
@@ -747,6 +760,7 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             result_img = draw_points_on_image(
                 img, data_series, None,
                 show_calibration=config.get("show_calibration", True),
+                show_calibration_values=config.get("show_calibration_values", False),
             )
             viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
@@ -769,6 +783,7 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                 result_img = draw_points_on_image(
                     img, data_series, axis_config,
                     show_calibration=config.get("show_calibration", True),
+                    show_calibration_values=config.get("show_calibration_values", False),
                 )
                 viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
