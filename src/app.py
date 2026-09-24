@@ -587,24 +587,16 @@ def create_wpd_tar(img, wpd_json, project_name="project"):
     return tar_buffer
 
 
-def main():
-    st.title("📈 AutoLineDigitizer")
-    st.markdown("""
-    Upload a chart image to extract line data automatically.
-    Output is compatible with **[StarryDigitizer](https://starrydigitizer.vercel.app/)** and **[WebPlotDigitizer](https://apps.automeris.io/wpd4/)**.
-
-    **[LineFormer Paper (ICDAR 2023)](https://arxiv.org/abs/2305.01837)** |
-    **[ChartDete Paper (ICDAR 2023)](https://arxiv.org/abs/2305.04151)**
-    """)
-
-    # Sidebar settings
+def _render_sidebar():
+    """Render sidebar settings shared across all tabs; return a config dict."""
     st.sidebar.header("Settings")
-
     show_visualization = st.sidebar.checkbox("Show visualization", value=True)
 
     st.sidebar.subheader("Axis Detection")
-    auto_axis = st.sidebar.checkbox("Auto-detect axis (ChartDete + OCR)", value=True,
-                                    help="Automatically detect axis labels and calibration")
+    auto_axis = st.sidebar.checkbox(
+        "Auto-detect axis (ChartDete + OCR)", value=True,
+        help="Automatically detect axis labels and calibration",
+    )
 
     st.sidebar.subheader("Line Sorting")
     sort_mode = st.sidebar.selectbox(
@@ -614,17 +606,14 @@ def main():
             "original": "Original (Detection Order)",
             "mean_y_desc": "Mean Y (High → Low)",
             "mean_y_asc": "Mean Y (Low → High)",
-        }[x]
+        }[x],
     )
 
     st.sidebar.subheader("Downsampling")
     downsample_mode = st.sidebar.selectbox(
-        "Mode",
-        options=["max_points", "fixed", "none"],
-        index=0,
-        help="max_points: Limit points per line, fixed: Every N points, none: All points"
+        "Mode", options=["max_points", "fixed", "none"], index=0,
+        help="max_points: Limit points per line, fixed: Every N points, none: All points",
     )
-
     if downsample_mode == "fixed":
         fixed_step = st.sidebar.slider("Fixed step (every N points)", 1, 50, 10)
         max_points = 50
@@ -632,10 +621,20 @@ def main():
         max_points = st.sidebar.slider("Max points per line", 10, 200, 50)
         fixed_step = 10
     else:
-        fixed_step = 10
-        max_points = 50
+        fixed_step, max_points = 10, 50
 
-    # Load LineFormer model
+    return dict(
+        show_visualization=show_visualization,
+        auto_axis=auto_axis,
+        sort_mode=sort_mode,
+        downsample_mode=downsample_mode,
+        fixed_step=fixed_step,
+        max_points=max_points,
+    )
+
+
+def _load_models(config):
+    """Load LineFormer (required) + ChartDete (optional); return both."""
     with st.spinner("Loading LineFormer model..."):
         try:
             infer_module = load_lineformer_model()
@@ -644,34 +643,65 @@ def main():
             st.error(f"Failed to load LineFormer: {e}")
             st.stop()
 
-    # Load ChartDete model if needed
     chartdete_module = None
-    if auto_axis:
+    if config["auto_axis"]:
         with st.spinner("Loading ChartDete model..."):
             try:
                 chartdete_module = load_chartdete_model()
                 st.sidebar.success("ChartDete loaded!")
             except Exception as e:
                 st.warning(f"ChartDete not available: {e}")
-                auto_axis = False
+                config["auto_axis"] = False
+    return infer_module, chartdete_module
 
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Upload a chart image",
-        type=["png", "jpg", "jpeg", "bmp", "tiff"]
-    )
 
-    # Status placeholder right after file uploader (below Drag and drop)
-    status_placeholder = st.empty()
+def _get_input_image(key_prefix="single"):
+    """Render file uploader + paste button; return (bgr ndarray, name) or (None, None)."""
+    upload_col, paste_col = st.columns([3, 1])
+    with upload_col:
+        uploaded_file = st.file_uploader(
+            "Upload a chart image (or paste from clipboard →)",
+            type=["png", "jpg", "jpeg", "bmp", "tiff"],
+            key=f"{key_prefix}_uploader",
+        )
+    with paste_col:
+        st.write("")
+        try:
+            from streamlit_paste_button import paste_image_button
+            paste_result = paste_image_button(
+                label="📋 Paste (Cmd+V)",
+                key=f"{key_prefix}_paste",
+                errors="ignore",
+            )
+        except Exception as _paste_err:  # noqa: BLE001
+            paste_result = None
+            st.caption(f"Paste unavailable: {_paste_err}")
 
     if uploaded_file is not None:
-        # Read image
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        return img, uploaded_file.name
+    if paste_result is not None and paste_result.image_data is not None:
+        pil_img = paste_result.image_data
+        img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        return img, f"clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    return None, None
 
-        if img is None:
-            st.error("Failed to read image")
-            st.stop()
+
+def _render_single_image_pipeline(img, name, infer_module, chartdete_module, config):
+    """Existing single-image workflow, refactored to accept a preloaded image."""
+    show_visualization = config["show_visualization"]
+    auto_axis = config["auto_axis"]
+    sort_mode = config["sort_mode"]
+    downsample_mode = config["downsample_mode"]
+    fixed_step = config["fixed_step"]
+    max_points = config["max_points"]
+
+    status_placeholder = st.empty()
+    if name.startswith("clipboard_"):
+        status_placeholder.success(f"Pasted from clipboard ({img.shape[1]}x{img.shape[0]})")
+
+    if True:
 
         # Initialize axis detection variables
         axis_config = None
@@ -776,7 +806,7 @@ def main():
         zip_buffer = create_starry_digitizer_zip(img, project_json)
 
         # Create TAR file for WebPlotDigitizer
-        base_name = os.path.splitext(uploaded_file.name)[0]
+        base_name = os.path.splitext(name)[0]
         tar_buffer = create_wpd_tar(img, wpd_json, project_name=base_name)
 
         # Generate filenames
@@ -837,6 +867,218 @@ def main():
 
         **WebPlotDigitizer:** Download TAR → Open [WPD](https://apps.automeris.io/wpd4/) → File → Load Project (.tar)
         """)
+
+
+def single_image_tab(infer_module, chartdete_module, config):
+    """Tab 1: single chart image → line extraction (the original workflow)."""
+    st.markdown("Upload a chart image (or paste from the clipboard) to extract line data.")
+    img, name = _get_input_image(key_prefix="single")
+    if img is not None:
+        _render_single_image_pipeline(img, name, infer_module, chartdete_module, config)
+
+
+def pdf_gallery_tab(infer_module, chartdete_module, config):
+    """Tab 2: upload a PDF, gallery-select figures, digitize per figure."""
+    st.markdown("Upload a paper PDF — every chart figure is detected and shown as a gallery.")
+    try:
+        import pdf_figures  # noqa: F401
+    except Exception as e:
+        st.error(f"PDF support unavailable: {e}")
+        return
+
+    pdf_file = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_uploader")
+    if pdf_file is None:
+        st.info("Waiting for a PDF…")
+        return
+
+    if ("pdf_bytes" not in st.session_state
+            or st.session_state.get("pdf_name") != pdf_file.name):
+        st.session_state["pdf_bytes"] = pdf_file.getvalue()
+        st.session_state["pdf_name"] = pdf_file.name
+        st.session_state.pop("pdf_figures_cache", None)
+
+    if "pdf_figures_cache" not in st.session_state:
+        with st.spinner("Extracting figures from PDF…"):
+            import tempfile, pdf_figures as pf
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(st.session_state["pdf_bytes"])
+                pdf_path = tmp.name
+            try:
+                figs = list(pf.extract_figures(pdf_path))
+                st.session_state["pdf_figures_cache"] = figs
+            except Exception as e:
+                st.error(f"Failed to extract figures: {e}")
+                return
+
+    figs = st.session_state["pdf_figures_cache"]
+    if not figs:
+        st.warning("No chart figures were detected in this PDF.")
+        return
+
+    st.success(f"Detected {len(figs)} figure(s).")
+    cols = st.columns(4)
+    for i, (fig_bgr, meta) in enumerate(figs):
+        with cols[i % 4]:
+            st.image(cv2.cvtColor(fig_bgr, cv2.COLOR_BGR2RGB),
+                     caption=f"#{i+1} p.{meta.get('page','?')}",
+                     use_container_width=True)
+            if st.button(f"Digitize #{i+1}", key=f"pdf_fig_btn_{i}"):
+                st.session_state["pdf_selected_idx"] = i
+
+    sel = st.session_state.get("pdf_selected_idx")
+    if sel is not None and 0 <= sel < len(figs):
+        st.divider()
+        st.subheader(f"Figure #{sel+1}")
+        fig_bgr, fig_meta = figs[sel]
+        base = f"{os.path.splitext(st.session_state['pdf_name'])[0]}_fig{sel+1}.png"
+        _render_single_image_pipeline(fig_bgr, base, infer_module, chartdete_module, config)
+
+
+def scatter_tab(config):
+    """Tab 3: scatter chart — detect markers directly (no line tracing)."""
+    st.markdown("Upload a scatter chart — markers are detected directly (LineFormer is skipped).")
+    try:
+        import marker_extractor  # noqa: F401
+    except Exception as e:
+        st.error(f"Marker extractor unavailable: {e}")
+        return
+
+    img, name = _get_input_image(key_prefix="scatter")
+    if img is None:
+        return
+
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=f"Input: {name}",
+             use_container_width=True)
+    with st.spinner("Detecting scatter markers…"):
+        try:
+            from marker_extractor import MarkerExtractor
+            extractor = MarkerExtractor(img)
+            result = extractor.extract()
+        except Exception as e:
+            st.error(f"Marker detection failed: {e}")
+            return
+
+    # MarkerExtractor.extract() returns a dict; adapt to the {points:[]} shape
+    # that draw_points_on_image expects.
+    series = []
+    if isinstance(result, dict) and "series" in result:
+        for s in result["series"]:
+            pts = s.get("points") or s.get("markers") or []
+            series.append({"points": [[int(p[0]), int(p[1])] for p in pts]})
+    elif isinstance(result, list):
+        series = [{"points": [[int(p[0]), int(p[1])] for p in s]} for s in result if s]
+
+    if not series:
+        st.warning("No markers detected. (MarkerExtractor returned an empty/unknown shape — "
+                   f"type={type(result).__name__})")
+        with st.expander("Raw result"):
+            st.write(result)
+        return
+    total = sum(len(s["points"]) for s in series)
+    st.success(f"Detected {len(series)} series, {total} points total.")
+    if config["show_visualization"]:
+        result_img = draw_points_on_image(img, series, None)
+        st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+
+def starrydata_tab():
+    """Tab 4: upload approved digitizations to Starrydata2/3."""
+    st.markdown("Push digitizations to **Starrydata2** (NIMS staging/production) or **Starrydata3** (local KMDS).")
+    with st.expander("Starrydata2 (NIMS internal API)"):
+        st.write("Set `SD2_TOKEN` env var or `~/.sd2_token` file. NIMS network only.")
+        base = st.text_input("Base URL", value="https://starrydata-stg.nims.go.jp",
+                             key="sd2_base")
+        export_json = st.file_uploader("Upload export.json (from tools/build_export_from_kmds)",
+                                       type=["json"], key="sd2_export")
+        commit = st.checkbox("Commit (uncheck for DRY-RUN)", value=False, key="sd2_commit")
+        if st.button("Push to Starrydata2", key="sd2_push"):
+            if export_json is None:
+                st.error("Upload an export.json first.")
+            else:
+                try:
+                    import tempfile, subprocess, os as _os
+                    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                        tmp.write(export_json.read())
+                        export_path = tmp.name
+                    args = [
+                        sys.executable,
+                        _os.path.join(_project_root, "tools", "starrydata_upload.py"),
+                        export_path, "--base", base,
+                    ]
+                    if commit:
+                        args.append("--commit")
+                    with st.spinner("Uploading…"):
+                        r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+                    st.code(r.stdout + "\n---STDERR---\n" + r.stderr, language="text")
+                    if r.returncode == 0:
+                        st.success("Upload finished.")
+                    else:
+                        st.error(f"Upload script exited with code {r.returncode}")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+
+    with st.expander("Starrydata3 (local KMDS)"):
+        try:
+            import starrydata3_client  # noqa: F401
+            st.write("Client module available.")
+        except Exception as e:
+            st.warning(f"Starrydata3 client not available: {e}")
+        url = st.text_input("Starrydata3 URL", value="", key="sd3_url")
+        key = st.text_input("API key", value="", type="password", key="sd3_key")
+        st.caption("Full Starrydata3 upload flow will be wired here — coming in a follow-up.")
+
+
+def vlm_kmds_tab():
+    """Tab 5: Claude curation + KMDS record editing (skeleton)."""
+    st.markdown("Claude-assisted axis reading, legend naming, and KMDS record editing.")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    st.text_input(
+        "ANTHROPIC_API_KEY (set via env or paste here for this session)",
+        value=api_key, type="password", key="vlm_api_key",
+        help="Not stored — env var wins if both set.",
+    )
+    st.info("VLM + KMDS wiring is in progress — the backend modules "
+            "(vlm_verifier, vlm_extract, kmds_parallel, kmds_editor, kmds_vocab) "
+            "all import cleanly, so hooking them into this tab is the next step.")
+    with st.expander("Backend module status"):
+        for m in ("vlm_verifier", "vlm_extract", "vlm_screener",
+                  "kmds_parallel", "kmds_editor", "kmds_vocab", "legend_mapper"):
+            try:
+                __import__(m); st.write(f"✅ `{m}`")
+            except Exception as e:
+                st.write(f"❌ `{m}`: {e}")
+
+
+def main():
+    st.title("📈 AutoLineDigitizer")
+    st.markdown("""
+    Extract chart line data from images or full PDFs.
+    Output is compatible with **[StarryDigitizer](https://starrydigitizer.vercel.app/)** and **[WebPlotDigitizer](https://apps.automeris.io/wpd4/)**.
+
+    **[LineFormer Paper (ICDAR 2023)](https://arxiv.org/abs/2305.01837)** |
+    **[ChartDete Paper (ICDAR 2023)](https://arxiv.org/abs/2305.04151)**
+    """)
+
+    config = _render_sidebar()
+    infer_module, chartdete_module = _load_models(config)
+
+    tab_single, tab_pdf, tab_scatter, tab_sd, tab_vlm = st.tabs([
+        "📈 Single Image",
+        "📄 PDF Gallery",
+        "⚫ Scatter",
+        "☁️ Starrydata",
+        "✨ Claude + KMDS",
+    ])
+    with tab_single:
+        single_image_tab(infer_module, chartdete_module, config)
+    with tab_pdf:
+        pdf_gallery_tab(infer_module, chartdete_module, config)
+    with tab_scatter:
+        scatter_tab(config)
+    with tab_sd:
+        starrydata_tab()
+    with tab_vlm:
+        vlm_kmds_tab()
 
 
 if __name__ == "__main__":
