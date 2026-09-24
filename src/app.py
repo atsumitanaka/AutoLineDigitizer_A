@@ -1257,22 +1257,33 @@ def vlm_kmds_tab():
 
 
 def main():
-    # Kill horizontal overflow and keep the layout inside one viewport.
-    # Report from Tanaka: window was horizontally scrollable, meaning
-    # content was wider than the viewport — usually an oversized image,
-    # a wide JSON code block, or Streamlit's default page max-width
-    # interacting with wide download-button rows.
+    # Full-width layout + zero horizontal scroll. Streamlit's default
+    # .block-container has a max-width of ~46rem even with layout="wide"
+    # in some builds, and various child elements (data_editor, wide code
+    # blocks, oversized images) still push past the viewport unless we
+    # clamp them explicitly.
     st.markdown("""
     <style>
-      html, body {overflow-x: hidden;}
-      .main .block-container {
-        padding-top: 0.6rem; padding-bottom: 0.6rem;
-        padding-left: 1rem; padding-right: 1rem;
-        max-width: 100%;
+      html, body {overflow-x: hidden !important; width: 100vw !important;}
+      * {max-width: 100%;}
+      [data-testid="stAppViewContainer"],
+      [data-testid="stMain"],
+      [data-testid="stHeader"] {
+        overflow-x: hidden !important;
+        max-width: 100vw !important;
       }
-      [data-testid="stAppViewContainer"] {overflow-x: hidden;}
-      [data-testid="stMain"]              {overflow-x: hidden;}
-      [data-testid="stImage"]             {overflow: hidden;}
+      .main .block-container,
+      section.main > div.block-container {
+        max-width: 100% !important;
+        width: 100% !important;
+        padding: 0.6rem 1rem !important;
+      }
+      /* Full width for the main content area next to the sidebar. */
+      section[data-testid="stSidebar"] + section {width: 100% !important;}
+      [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
+
+      /* Image: fit inside its column both ways. */
+      [data-testid="stImage"] {overflow: hidden; max-width: 100%;}
       [data-testid="stImage"] img {
         max-height: 55vh;
         max-width: 100%;
@@ -1282,15 +1293,21 @@ def main():
         margin: 0 auto;
         display: block;
       }
-      [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
+
       /* Long JSON lines were the other source of horizontal scroll. */
       pre, code {white-space: pre-wrap !important; word-break: break-word;}
+
+      /* Data editor / dataframe: keep inside the column width. */
+      [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+        max-width: 100% !important;
+        overflow-x: auto;  /* scroll INSIDE the table, not the whole page */
+      }
+
       div[data-testid="stExpander"] summary {padding: 0.25rem 0.5rem;}
       h1 {font-size: 1.4rem !important; margin: 0.2rem 0 0.3rem 0 !important;}
       h2 {font-size: 1.15rem !important; margin: 0.3rem 0 !important;}
       h3 {font-size: 1rem !important;    margin: 0.25rem 0 !important;}
       .stMarkdown p {margin-bottom: 0.3rem;}
-      /* Compact download-button row so 3 buttons never wrap past the fold. */
       [data-testid="stDownloadButton"] button {white-space: nowrap;}
     </style>
     """, unsafe_allow_html=True)
