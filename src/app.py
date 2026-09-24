@@ -1293,15 +1293,33 @@ def main():
       [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
 
       /* Image: fit inside its column both ways. */
-      [data-testid="stImage"] {overflow: hidden; max-width: 100%;}
-      [data-testid="stImage"] img {
-        max-height: 55vh;
-        max-width: 100%;
-        width: auto;
-        height: auto;
-        object-fit: contain;
-        margin: 0 auto;
-        display: block;
+      /* Image container — clip anything oversized and cap height. */
+      [data-testid="stImage"] {
+        overflow: hidden !important;
+        max-width: 100% !important;
+        max-height: 55vh !important;
+      }
+      /* Force image itself to fit BOTH width and height of its column. */
+      [data-testid="stImage"] img,
+      [data-testid="stImage"] > img,
+      div[data-testid="stImage"] img {
+        max-width: 100% !important;
+        max-height: 55vh !important;
+        width: 100% !important;
+        height: auto !important;
+        object-fit: contain !important;
+        margin: 0 auto !important;
+        display: block !important;
+      }
+      /* Columns must never grow past the row width. */
+      [data-testid="stColumn"], [data-testid="column"] {
+        min-width: 0 !important;
+        max-width: 100% !important;
+        overflow: hidden;
+      }
+      [data-testid="stHorizontalBlock"] {
+        max-width: 100% !important;
+        flex-wrap: wrap;
       }
 
       /* Long JSON lines were the other source of horizontal scroll. */
