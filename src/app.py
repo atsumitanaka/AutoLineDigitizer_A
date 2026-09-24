@@ -1264,11 +1264,21 @@ def main():
     # clamp them explicitly.
     st.markdown("""
     <style>
-      html, body {overflow-x: hidden !important; width: 100vw !important;}
+      /* Hide Streamlit's built-in header (Deploy button, 3-dot menu, "Running"
+         badge). Their fixed slot on the right was the reason the page could
+         still slide sideways even after overflow-x: hidden — Streamlit
+         reserves horizontal space for them regardless of layout=wide. */
+      header[data-testid="stHeader"] {display: none !important;}
+      [data-testid="stToolbar"]      {display: none !important;}
+      [data-testid="stDecoration"]   {display: none !important;}
+      [data-testid="stStatusWidget"] {display: none !important;}
+      #MainMenu {visibility: hidden !important;}
+      footer   {visibility: hidden !important;}
+
+      html, body {overflow-x: hidden !important; width: 100% !important;}
       * {max-width: 100%;}
       [data-testid="stAppViewContainer"],
-      [data-testid="stMain"],
-      [data-testid="stHeader"] {
+      [data-testid="stMain"] {
         overflow-x: hidden !important;
         max-width: 100vw !important;
       }
