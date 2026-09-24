@@ -29,6 +29,9 @@ sys.path.insert(0, _src_dir)
 import streamlit as st
 import cv2
 import numpy as np
+import pandas as pd
+import hashlib
+import copy
 import json
 import io
 import zipfile
@@ -193,16 +196,52 @@ def extract_lines(infer_module, img, downsample_mode, fixed_step, max_points):
     return data_series, line_dataseries
 
 
+def _pixel_to_data(px, py, axis_config):
+    """Convert image pixel coords to data-space (x, y) using the calibration."""
+    if not axis_config:
+        return px, py
+    x1p, x2p = float(axis_config['x1_px']), float(axis_config['x2_px'])
+    y1p, y2p = float(axis_config['y1_py']), float(axis_config['y2_py'])
+    x1v, x2v = float(axis_config['x1_val']), float(axis_config['x2_val'])
+    y1v, y2v = float(axis_config['y1_val']), float(axis_config['y2_val'])
+    dx_px = (x2p - x1p) or 1.0
+    dy_px = (y2p - y1p) or 1.0
+    x = x1v + (float(px) - x1p) * (x2v - x1v) / dx_px
+    y = y1v + (float(py) - y1p) * (y2v - y1v) / dy_px
+    return x, y
+
+
+def _data_to_pixel(x, y, axis_config):
+    """Inverse of _pixel_to_data — data-space (x, y) → image pixel coords."""
+    if not axis_config:
+        return float(x), float(y)
+    x1p, x2p = float(axis_config['x1_px']), float(axis_config['x2_px'])
+    y1p, y2p = float(axis_config['y1_py']), float(axis_config['y2_py'])
+    x1v, x2v = float(axis_config['x1_val']), float(axis_config['x2_val'])
+    y1v, y2v = float(axis_config['y1_val']), float(axis_config['y2_val'])
+    dx_v = (x2v - x1v) or 1.0
+    dy_v = (y2v - y1v) or 1.0
+    px = x1p + (float(x) - x1v) * (x2p - x1p) / dx_v
+    py = y1p + (float(y) - y1v) * (y2p - y1p) / dy_v
+    return px, py
+
+
 def draw_points_on_image(img, data_series, axis_config=None,
-                         show_calibration=True, show_calibration_values=False):
-    """Draw extracted points as symbols on image, with optional axis calibration markers."""
+                         show_calibration=True, show_calibration_values=False,
+                         show_line_numbers=False, highlight_idx=None,
+                         line_indices=None, total_lines=None):
+    """Draw extracted points on the image.
+
+    line_indices: optional list mapping each entry of data_series back to its
+      original line number (so filtering to one line keeps its color/number).
+    total_lines: original series count, used to pick colors consistently.
+    highlight_idx: if set, drawn line is emphasized (larger markers).
+    """
     import line_utils
 
     result_img = img.copy()
-    num_lines = len(data_series)
-    colors = list(line_utils.get_distinct_colors(num_lines))
-
-    # Marker symbols (using different shapes)
+    n = total_lines if total_lines is not None else len(data_series)
+    palette = list(line_utils.get_distinct_colors(max(1, n)))
     markers = [
         cv2.MARKER_CROSS,
         cv2.MARKER_DIAMOND,
@@ -212,13 +251,35 @@ def draw_points_on_image(img, data_series, axis_config=None,
         cv2.MARKER_STAR,
     ]
 
-    for line_idx, series in enumerate(data_series):
-        color = colors[line_idx]
-        marker = markers[line_idx % len(markers)]
+    for local_idx, series in enumerate(data_series):
+        orig_idx = line_indices[local_idx] if line_indices is not None else local_idx
+        color = palette[orig_idx % len(palette)]
+        marker = markers[orig_idx % len(markers)]
+        emph = (highlight_idx is not None and orig_idx == highlight_idx)
+        size = 14 if emph else 8
+        thick = 3 if emph else 2
 
         for pt in series["points"]:
             x, y = int(pt[0]), int(pt[1])
-            cv2.drawMarker(result_img, (x, y), color, marker, markerSize=8, thickness=2)
+            cv2.drawMarker(result_img, (x, y), color, marker,
+                           markerSize=size, thickness=thick)
+
+        # Number label near the first point of the line.
+        if show_line_numbers and series["points"]:
+            fx, fy = int(series["points"][0][0]), int(series["points"][0][1])
+            label = str(orig_idx + 1)
+            H, W = result_img.shape[:2]
+            fscale = max(0.5, min(W, H) / 1400.0)
+            (tw, th), _bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                            fscale, 2)
+            lx = max(2, min(W - tw - 2, fx + 6))
+            ly = max(th + 2, min(H - 2, fy - 6))
+            cv2.rectangle(result_img, (lx - 2, ly - th - 2),
+                          (lx + tw + 2, ly + 2), (255, 255, 255), -1)
+            cv2.rectangle(result_img, (lx - 2, ly - th - 2),
+                          (lx + tw + 2, ly + 2), (0, 0, 0), 1)
+            cv2.putText(result_img, label, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, fscale, color, 2, cv2.LINE_AA)
 
     # Draw axis calibration points if available
     if axis_config is not None and show_calibration:
@@ -755,42 +816,42 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                 # Sort lines
                 data_series = sort_data_series(data_series, sort_mode)
 
+        # ---- Session-state per image: preserve user edits across reruns ----
+        img_bytes_key = hashlib.md5(img.tobytes()).hexdigest()[:12]
+        ss_key = f"series_{img_bytes_key}"
+        ax_key = f"axis_{img_bytes_key}"
+        if ss_key not in st.session_state:
+            st.session_state[ss_key] = copy.deepcopy(data_series)
+        edited_series = st.session_state[ss_key]
+
         # Show initial result (without axis calibration) immediately
         if show_visualization:
             result_img = draw_points_on_image(
-                img, data_series, None,
+                img, edited_series, None,
                 show_calibration=config.get("show_calibration", True),
                 show_calibration_values=config.get("show_calibration_values", False),
+                show_line_numbers=True,
             )
             viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         # Show line summary
-        total_points = sum(len(s['points']) for s in data_series)
-        line_pts = [len(s['points']) for s in data_series]
-        summary_placeholder.success(f"**{len(data_series)} lines** detected ({total_points} points total)")
+        total_points = sum(len(s['points']) for s in edited_series)
+        line_pts = [len(s['points']) for s in edited_series]
+        summary_placeholder.success(f"**{len(edited_series)} lines** detected ({total_points} points total)")
         caption_placeholder.caption(f"Points per line: {', '.join(map(str, line_pts))}")
 
         # Step 2: Run axis detection (slower, OCR-heavy) - with spinner
         if auto_axis and chartdete_module is not None:
-            with status_placeholder.container():
-                with st.spinner("🔍 Detecting axis labels (ChartDete + OCR)..."):
-                    axis_config, detections, ocr_results = detect_axis_calibration(
-                        chartdete_module, img
-                    )
-
-            # Update visualization with axis calibration
-            if show_visualization:
-                result_img = draw_points_on_image(
-                    img, data_series, axis_config,
-                    show_calibration=config.get("show_calibration", True),
-                    show_calibration_values=config.get("show_calibration_values", False),
-                )
-                viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-            # Clear the status
+            if ax_key not in st.session_state:
+                with status_placeholder.container():
+                    with st.spinner("🔍 Detecting axis labels (ChartDete + OCR)..."):
+                        axis_config, detections, ocr_results = detect_axis_calibration(
+                            chartdete_module, img
+                        )
+                st.session_state[ax_key] = (axis_config, detections, ocr_results)
+            axis_config, detections, ocr_results = st.session_state[ax_key]
             status_placeholder.empty()
         else:
-            # Clear status if no axis detection
             status_placeholder.empty()
 
         # Show axis calibration results
@@ -819,14 +880,114 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         elif auto_axis:
             axis_placeholder.warning("Could not auto-detect axis calibration. Manual calibration needed in WPD/StarryDigitizer.")
 
+        # ---- Per-curve inspection & editing ----
+        st.subheader("Curves")
+        curve_labels = ["All curves"] + [
+            f"Line {i+1} ({len(s['points'])} pts)"
+            for i, s in enumerate(edited_series)
+        ]
+        sel = st.selectbox(
+            "Show", curve_labels, index=0,
+            key=f"curve_sel_{img_bytes_key}",
+            help="Pick a single line to isolate it in the visualization and "
+                 "edit its X/Y points below.",
+        )
+
+        if sel == "All curves":
+            viz_data = edited_series
+            viz_indices = list(range(len(edited_series)))
+            highlight = None
+        else:
+            idx = curve_labels.index(sel) - 1
+            viz_data = [edited_series[idx]]
+            viz_indices = [idx]
+            highlight = idx
+
+        # Re-render viz with selection + numbers baked in.
+        if show_visualization:
+            result_img = draw_points_on_image(
+                img, viz_data, axis_config,
+                show_calibration=config.get("show_calibration", True),
+                show_calibration_values=config.get("show_calibration_values", False),
+                show_line_numbers=True,
+                highlight_idx=highlight,
+                line_indices=viz_indices,
+                total_lines=len(edited_series),
+            )
+            viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
+                                  use_container_width=True)
+
+        # XY table editor for the selected single curve.
+        if sel != "All curves":
+            idx = curve_labels.index(sel) - 1
+            pts_px = edited_series[idx]["points"]
+            if axis_config is not None:
+                rows = [_pixel_to_data(p[0], p[1], axis_config) for p in pts_px]
+                cols = ("X", "Y")
+                cal_note = " (data-space, using detected calibration)"
+            else:
+                rows = [(float(p[0]), float(p[1])) for p in pts_px]
+                cols = ("X_px", "Y_px")
+                cal_note = " (pixel coords — no calibration detected)"
+            df = pd.DataFrame(rows, columns=cols)
+            st.caption(f"Line {idx+1} — {len(rows)} points{cal_note}. "
+                       "Edit any cell, add rows at the bottom, or use the row "
+                       "checkbox + Delete key to remove points.")
+            edited_df = st.data_editor(
+                df, num_rows="dynamic", use_container_width=True,
+                key=f"editor_{img_bytes_key}_{idx}",
+                column_config={c: st.column_config.NumberColumn(c, format="%.6g")
+                               for c in cols},
+            )
+
+            new_pts = []
+            for row in edited_df.itertuples(index=False):
+                try:
+                    x, y = float(row[0]), float(row[1])
+                except (TypeError, ValueError):
+                    continue
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    continue
+                if axis_config is not None:
+                    px, py = _data_to_pixel(x, y, axis_config)
+                else:
+                    px, py = x, y
+                new_pts.append([int(round(px)), int(round(py))])
+
+            btn_col1, btn_col2, _ = st.columns([1, 1, 3])
+            with btn_col1:
+                if st.button("💾 Apply edits", key=f"apply_{img_bytes_key}_{idx}",
+                             type="primary"):
+                    st.session_state[ss_key][idx]["points"] = new_pts
+                    st.rerun()
+            with btn_col2:
+                if st.button("↩︎ Reset this line",
+                             key=f"reset_{img_bytes_key}_{idx}"):
+                    st.session_state[ss_key][idx]["points"] = copy.deepcopy(
+                        data_series[idx]["points"])
+                    st.rerun()
+
+            if len(new_pts) != len(pts_px):
+                st.info(f"Pending: {len(new_pts)} points "
+                        f"(was {len(pts_px)}). Press **Apply edits** to save.")
+
+        else:
+            reset_col1, _ = st.columns([1, 4])
+            with reset_col1:
+                if st.button("↩︎ Reset all lines to auto-detected",
+                             key=f"reset_all_{img_bytes_key}"):
+                    st.session_state[ss_key] = copy.deepcopy(data_series)
+                    st.rerun()
+
+        # Downloads/exports use the *edited* series so user changes reach WPD/SD.
         # Build StarryDigitizer project
         project_json = convert_to_starry_digitizer_format(
-            data_series, img.shape, axis_config
+            edited_series, img.shape, axis_config
         )
 
         # Build WebPlotDigitizer project
         wpd_json = convert_to_wpd_format(
-            data_series, img.shape, axis_config
+            edited_series, img.shape, axis_config
         )
 
         # Create ZIP file for StarryDigitizer
@@ -872,6 +1033,25 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                     file_name=f"{base_name}_result.png",
                     mime="image/png"
                 )
+
+        # ---- CSV export of the edited curves ----
+        csv_lines = ["line,x,y"]
+        for li, s in enumerate(edited_series, 1):
+            for p in s["points"]:
+                if axis_config is not None:
+                    x, y = _pixel_to_data(p[0], p[1], axis_config)
+                else:
+                    x, y = float(p[0]), float(p[1])
+                csv_lines.append(f"{li},{x:.6g},{y:.6g}")
+        csv_bytes = "\n".join(csv_lines).encode("utf-8")
+        st.download_button(
+            label=f"⬇️ Combined CSV (all {len(edited_series)} lines, "
+                  f"{'data' if axis_config else 'pixel'} coords)",
+            data=csv_bytes,
+            file_name=f"{base_name}_curves.csv",
+            mime="text/csv",
+            key=f"csv_dl_{img_bytes_key}",
+        )
 
         # Show JSON previews
         with st.expander("Preview StarryDigitizer project.json"):
