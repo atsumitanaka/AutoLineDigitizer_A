@@ -1293,29 +1293,27 @@ def main():
       [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
 
       /* Image: fit inside its column both ways. */
-      /* Image container — clip anything oversized and cap height. */
-      [data-testid="stImage"] {
-        overflow: hidden !important;
-        max-width: 100% !important;
-        max-height: 55vh !important;
-      }
-      /* Force image itself to fit BOTH width and height of its column. */
+      /* Image: obey BOTH max-width (column) AND max-height (viewport) so
+         landscape charts shrink to fit without ever being clipped. Do NOT
+         force width:100% — that overrides the natural aspect and cuts the
+         axis ticks off along one edge. */
       [data-testid="stImage"] img,
       [data-testid="stImage"] > img,
       div[data-testid="stImage"] img {
         max-width: 100% !important;
         max-height: 55vh !important;
-        width: 100% !important;
+        width: auto !important;
         height: auto !important;
-        object-fit: contain !important;
         margin: 0 auto !important;
         display: block !important;
+        object-fit: contain !important;
       }
-      /* Columns must never grow past the row width. */
+      /* Column must be allowed to shrink below its content (default
+         min-width:auto blocks that) but NOT clip children — clipping
+         was what removed the calibration markers near the image edge. */
       [data-testid="stColumn"], [data-testid="column"] {
         min-width: 0 !important;
         max-width: 100% !important;
-        overflow: hidden;
       }
       [data-testid="stHorizontalBlock"] {
         max-width: 100% !important;
