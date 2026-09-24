@@ -2193,16 +2193,85 @@ def main(page: ft.Page):
                 process_status_text.value = "Failed to read image"
                 page.update()
 
+    def _grab_clipboard_image():
+        """Return (bgr_ndarray, saved_png_path, error_msg). Two of them are None."""
+        import tempfile
+        pil_err = None
+        # 1) Try Pillow ImageGrab first (works on macOS with Pillow >= 9.4).
+        try:
+            from PIL import ImageGrab
+            pil_img = ImageGrab.grabclipboard()
+            if isinstance(pil_img, list) and pil_img:
+                # Clipboard held file paths (e.g. Finder copy) — read the first image file.
+                for p in pil_img:
+                    img = cv2.imread(p)
+                    if img is not None:
+                        return img, p, None
+                pil_err = f"clipboard held files but none were readable images: {pil_img}"
+            elif pil_img is not None and hasattr(pil_img, "convert"):
+                img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+                tmp = tempfile.NamedTemporaryFile(prefix="clipboard_", suffix=".png", delete=False)
+                tmp.close()
+                cv2.imwrite(tmp.name, img)
+                return img, tmp.name, None
+            else:
+                pil_err = "no image in clipboard"
+        except ImportError as ex:
+            pil_err = f"Pillow ImageGrab unavailable: {ex}"
+        except Exception as ex:  # noqa: BLE001
+            pil_err = f"Pillow ImageGrab failed: {ex}"
+
+        # 2) macOS fallback via osascript — writes the clipboard PNG to a temp file.
+        if sys.platform == "darwin":
+            try:
+                import subprocess
+                tmp = tempfile.NamedTemporaryFile(prefix="clipboard_", suffix=".png", delete=False)
+                tmp.close()
+                script = (
+                    'try\n'
+                    '    set thePng to (the clipboard as «class PNGf»)\n'
+                    '    set fh to open for access POSIX file "%s" with write permission\n'
+                    '    set eof of fh to 0\n'
+                    '    write thePng to fh\n'
+                    '    close access fh\n'
+                    '    return "ok"\n'
+                    'on error errMsg\n'
+                    '    try\n'
+                    '        close access fh\n'
+                    '    end try\n'
+                    '    return "err:" & errMsg\n'
+                    'end try'
+                ) % tmp.name
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip() == "ok":
+                    img = cv2.imread(tmp.name)
+                    if img is not None:
+                        return img, tmp.name, None
+                    return None, None, f"osascript wrote a file that could not be read: {tmp.name}"
+                osa_msg = (result.stdout.strip() or result.stderr.strip()
+                           or f"osascript exited {result.returncode}")
+                return None, None, f"Clipboard has no image ({pil_err}; {osa_msg})"
+            except Exception as ex:  # noqa: BLE001
+                return None, None, f"Clipboard paste failed ({pil_err}; osascript: {ex})"
+        return None, None, f"Clipboard has no image ({pil_err})"
+
+    def paste_from_clipboard(_=None):
+        img, saved_path, err = _grab_clipboard_image()
+        if img is not None:
+            load_image(img, saved_path)
+            process_status_text.value = (
+                f"Pasted from clipboard ({img.shape[1]}x{img.shape[0]})"
+            )
+        else:
+            process_status_text.value = err or "Paste failed"
+        page.update()
+
     def on_keyboard(e: ft.KeyboardEvent):
         if e.key == "V" and (e.meta or e.ctrl):
-            try:
-                from PIL import ImageGrab
-                pil_img = ImageGrab.grabclipboard()
-                if pil_img is not None:
-                    img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
-                    load_image(img)
-            except Exception:
-                pass
+            paste_from_clipboard()
 
     page.on_keyboard_event = on_keyboard
     file_picker = ft.FilePicker(on_result=pick_files_result)
@@ -3680,6 +3749,14 @@ def main(page: ft.Page):
         on_click=lambda _: file_picker.pick_files(allowed_extensions=["png", "jpg", "jpeg", "bmp", "tiff"]),
     )
 
+    paste_btn = ft.OutlinedButton(
+        "Paste", icon=ft.icons.CONTENT_PASTE,
+        tooltip="Paste an image from the clipboard (Cmd+V). "
+                "Screenshots taken with Ctrl+Cmd+Shift+4 or images copied from "
+                "any app can be pasted here without saving them first.",
+        on_click=paste_from_clipboard,
+    )
+
     open_pdf_btn = ft.FilledButton(
         "Open PDF", icon=ft.icons.PICTURE_AS_PDF, disabled=not PDF_SUPPORT,
         tooltip="Extract all chart figures from a PDF and edit each one."
@@ -4143,7 +4220,7 @@ def main(page: ft.Page):
 
     toolbar_card = _card(
         ft.Column([
-            ft.Row([upload_btn, open_pdf_btn,
+            ft.Row([upload_btn, paste_btn, open_pdf_btn,
                     _vsep(),
                     pdf_detector_dropdown, review_figures_btn, recrop_btn, delete_fig_btn,
                     _vsep(),
