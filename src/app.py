@@ -193,7 +193,7 @@ def extract_lines(infer_module, img, downsample_mode, fixed_step, max_points):
     return data_series, line_dataseries
 
 
-def draw_points_on_image(img, data_series, axis_config=None):
+def draw_points_on_image(img, data_series, axis_config=None, show_calibration=True):
     """Draw extracted points as symbols on image, with optional axis calibration markers."""
     import line_utils
 
@@ -220,93 +220,93 @@ def draw_points_on_image(img, data_series, axis_config=None):
             cv2.drawMarker(result_img, (x, y), color, marker, markerSize=8, thickness=2)
 
     # Draw axis calibration points if available
-    if axis_config is not None:
-        # Single color for all calibration points (Magenta - visible on white backgrounds)
-        calib_color = (255, 0, 255)   # Magenta (BGR)
-        outline_color = (0, 0, 0)  # Black outline for contrast
+    if axis_config is not None and show_calibration:
+        H, W = result_img.shape[:2]
+        # Scale everything with image size so a 1300px chart doesn't get a
+        # 40-point font that swamps the tick labels.
+        s = max(0.35, min(W, H) / 1600.0)
+        calib_color = (255, 0, 255)
+        outline_color = (0, 0, 0)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.8
-        thickness = 2
+        font_scale = 0.45 * s
+        thickness = max(1, int(round(1.2 * s)))
+        marker_r_outer = max(4, int(round(7 * s)))
+        marker_r_inner = max(3, int(round(5 * s)))
+        cross_arm = max(2, int(round(3 * s)))
+        label_pad = max(1, int(round(2 * s)))
 
-        # Helper function to draw text with background
         def draw_text_with_bg(img, text, pos, color):
             (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
             x, y = pos
-            # Draw background rectangle
-            padding = 3
-            cv2.rectangle(img, (x - padding, y - text_h - padding),
-                         (x + text_w + padding, y + baseline + padding),
-                         (255, 255, 255), -1)  # White background
-            cv2.rectangle(img, (x - padding, y - text_h - padding),
-                         (x + text_w + padding, y + baseline + padding),
-                         outline_color, 1)  # Black border
-            # Draw text
-            cv2.putText(img, text, (x, y), font, font_scale, color, thickness)
+            # Clamp to image so labels never render off-canvas.
+            x = max(label_pad, min(W - text_w - label_pad, x))
+            y = max(text_h + label_pad, min(H - baseline - label_pad, y))
+            cv2.rectangle(img, (x - label_pad, y - text_h - label_pad),
+                          (x + text_w + label_pad, y + baseline + label_pad),
+                          (255, 255, 255), -1)
+            cv2.rectangle(img, (x - label_pad, y - text_h - label_pad),
+                          (x + text_w + label_pad, y + baseline + label_pad),
+                          outline_color, 1)
+            cv2.putText(img, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
-        # Helper function to draw calibration point with marker
-        def draw_calib_point(img, x, y, color, label, label_offset):
-            # Draw filled circle with outline
-            cv2.circle(img, (x, y), 12, outline_color, 3)  # Black outline
-            cv2.circle(img, (x, y), 10, color, -1)  # Filled circle
-            cv2.circle(img, (x, y), 10, outline_color, 2)  # Inner outline
-            # Draw crosshair inside circle
-            cv2.line(img, (x - 6, y), (x + 6, y), outline_color, 2)
-            cv2.line(img, (x, y - 6), (x, y + 6), outline_color, 2)
-            # Draw label with background
-            label_x = x + label_offset[0]
-            label_y = y + label_offset[1]
-            draw_text_with_bg(img, label, (label_x, label_y), color)
+        def draw_calib_point(img, x, y, color, label, side):
+            cv2.circle(img, (x, y), marker_r_outer, outline_color, 1)
+            cv2.circle(img, (x, y), marker_r_inner, color, -1)
+            cv2.line(img, (x - cross_arm, y), (x + cross_arm, y), outline_color, 1)
+            cv2.line(img, (x, y - cross_arm), (x, y + cross_arm), outline_color, 1)
+            # Place the label OUTSIDE the plot area on the correct side of the
+            # figure so it never sits on top of the printed tick label.
+            (tw, th), _bl = cv2.getTextSize(label, font, font_scale, thickness)
+            gap = max(4, int(round(6 * s)))
+            if side == "left":
+                lx = max(label_pad, x - marker_r_outer - gap - tw)
+                ly = y + th // 2
+            elif side == "right":
+                lx = min(W - tw - label_pad, x + marker_r_outer + gap)
+                ly = y + th // 2
+            elif side == "above":
+                lx = x - tw // 2
+                ly = max(th + label_pad, y - marker_r_outer - gap)
+            else:  # below
+                lx = x - tw // 2
+                ly = min(H - _bl - label_pad, y + marker_r_outer + gap + th)
+            draw_text_with_bg(img, label, (lx, ly), color)
 
-        # Get calibration points
         x1_x, x1_y = int(axis_config['x1_px']), int(axis_config['x1_py'])
         x2_x, x2_y = int(axis_config['x2_px']), int(axis_config['x2_py'])
         y1_x, y1_y = int(axis_config['y1_px']), int(axis_config['y1_py'])
         y2_x, y2_y = int(axis_config['y2_px']), int(axis_config['y2_py'])
 
-        # Draw dashed lines connecting calibration points
-        # X-axis line (X1 to X2)
-        dash_length = 10
-        gap_length = 5
-        # Draw dashed line for X-axis
-        dx = x2_x - x1_x
-        dy = x2_y - x1_y
-        dist = max(1, int(np.sqrt(dx*dx + dy*dy)))
-        for i in range(0, dist, dash_length + gap_length):
-            start_x = int(x1_x + dx * i / dist)
-            start_y = int(x1_y + dy * i / dist)
-            end_i = min(i + dash_length, dist)
-            end_x = int(x1_x + dx * end_i / dist)
-            end_y = int(x1_y + dy * end_i / dist)
-            cv2.line(result_img, (start_x, start_y), (end_x, end_y), calib_color, 2)
+        # Dashed calibration axes
+        dash_length = max(4, int(round(6 * s)))
+        gap_length = max(2, int(round(3 * s)))
+        for (ax1, ay1, ax2, ay2) in [(x1_x, x1_y, x2_x, x2_y),
+                                     (y1_x, y1_y, y2_x, y2_y)]:
+            dx, dy = ax2 - ax1, ay2 - ay1
+            dist = max(1, int(np.sqrt(dx * dx + dy * dy)))
+            for i in range(0, dist, dash_length + gap_length):
+                sx = int(ax1 + dx * i / dist)
+                sy = int(ay1 + dy * i / dist)
+                ei = min(i + dash_length, dist)
+                ex = int(ax1 + dx * ei / dist)
+                ey = int(ay1 + dy * ei / dist)
+                cv2.line(result_img, (sx, sy), (ex, ey), calib_color, thickness)
 
-        # Draw dashed line for Y-axis
-        dx = y2_x - y1_x
-        dy = y2_y - y1_y
-        dist = max(1, int(np.sqrt(dx*dx + dy*dy)))
-        for i in range(0, dist, dash_length + gap_length):
-            start_x = int(y1_x + dx * i / dist)
-            start_y = int(y1_y + dy * i / dist)
-            end_i = min(i + dash_length, dist)
-            end_x = int(y1_x + dx * end_i / dist)
-            end_y = int(y1_y + dy * end_i / dist)
-            cv2.line(result_img, (start_x, start_y), (end_x, end_y), calib_color, 2)
-
-        # Draw calibration points with labels
-        # X1 point (left on X axis)
+        # Compact labels (drop the "X1="/"Y1=" prefix — the position tells you which)
+        def _fmt(v):
+            try:
+                fv = float(v)
+                return f"{fv:g}"
+            except (TypeError, ValueError):
+                return str(v)
         draw_calib_point(result_img, x1_x, x1_y, calib_color,
-                        f"X1={axis_config['x1_val']}", (15, -5))
-
-        # X2 point (right on X axis) - label on left side to avoid edge
+                         _fmt(axis_config['x1_val']), "below")
         draw_calib_point(result_img, x2_x, x2_y, calib_color,
-                        f"X2={axis_config['x2_val']}", (-100, -5))
-
-        # Y1 point (bottom on Y axis)
+                         _fmt(axis_config['x2_val']), "below")
         draw_calib_point(result_img, y1_x, y1_y, calib_color,
-                        f"Y1={axis_config['y1_val']}", (15, 20))
-
-        # Y2 point (top on Y axis)
+                         _fmt(axis_config['y1_val']), "left")
         draw_calib_point(result_img, y2_x, y2_y, calib_color,
-                        f"Y2={axis_config['y2_val']}", (15, -5))
+                         _fmt(axis_config['y2_val']), "left")
 
     return result_img
 
@@ -597,6 +597,11 @@ def _render_sidebar():
         "Auto-detect axis (ChartDete + OCR)", value=True,
         help="Automatically detect axis labels and calibration",
     )
+    show_calibration = st.sidebar.checkbox(
+        "Show calibration overlay on chart", value=True,
+        help="Draws the four calibration points + dashed axes on the result "
+             "image. Turn OFF if the labels obscure the printed tick values.",
+    )
 
     st.sidebar.subheader("Line Sorting")
     sort_mode = st.sidebar.selectbox(
@@ -626,6 +631,7 @@ def _render_sidebar():
     return dict(
         show_visualization=show_visualization,
         auto_axis=auto_axis,
+        show_calibration=show_calibration,
         sort_mode=sort_mode,
         downsample_mode=downsample_mode,
         fixed_step=fixed_step,
@@ -738,7 +744,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
 
         # Show initial result (without axis calibration) immediately
         if show_visualization:
-            result_img = draw_points_on_image(img, data_series, None)
+            result_img = draw_points_on_image(
+                img, data_series, None,
+                show_calibration=config.get("show_calibration", True),
+            )
             viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         # Show line summary
@@ -757,7 +766,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
 
             # Update visualization with axis calibration
             if show_visualization:
-                result_img = draw_points_on_image(img, data_series, axis_config)
+                result_img = draw_points_on_image(
+                    img, data_series, axis_config,
+                    show_calibration=config.get("show_calibration", True),
+                )
                 viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
             # Clear the status
