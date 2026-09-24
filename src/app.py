@@ -1264,22 +1264,13 @@ def main():
     # clamp them explicitly.
     st.markdown("""
     <style>
-      /* Block trackpad horizontal pan + browser swipe-back-gesture. */
-      html, body {
-        overflow-x: hidden !important;
-        width: 100% !important;
-        max-width: 100vw !important;
-        overscroll-behavior-x: none !important;
-        touch-action: pan-y !important;
-        position: relative;
-      }
+      html, body {overflow-x: hidden !important; width: 100vw !important;}
       * {max-width: 100%;}
       [data-testid="stAppViewContainer"],
       [data-testid="stMain"],
       [data-testid="stHeader"] {
         overflow-x: hidden !important;
         max-width: 100vw !important;
-        overscroll-behavior-x: none !important;
       }
       .main .block-container,
       section.main > div.block-container {
@@ -1287,13 +1278,11 @@ def main():
         width: 100% !important;
         padding: 0.6rem 1rem !important;
       }
+      /* Full width for the main content area next to the sidebar. */
       section[data-testid="stSidebar"] + section {width: 100% !important;}
       [data-testid="stSidebar"] {min-width: 240px; max-width: 280px;}
 
-      /* Streamlit components (paste button, drawable canvas, etc.) render in
-         iframes — clamp them so their internal width can't push the page. */
-      iframe {max-width: 100% !important;}
-
+      /* Image: fit inside its column both ways. */
       [data-testid="stImage"] {overflow: hidden; max-width: 100%;}
       [data-testid="stImage"] img {
         max-height: 55vh;
@@ -1305,11 +1294,13 @@ def main():
         display: block;
       }
 
+      /* Long JSON lines were the other source of horizontal scroll. */
       pre, code {white-space: pre-wrap !important; word-break: break-word;}
 
+      /* Data editor / dataframe: keep inside the column width. */
       [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
         max-width: 100% !important;
-        overflow-x: auto;
+        overflow-x: auto;  /* scroll INSIDE the table, not the whole page */
       }
 
       div[data-testid="stExpander"] summary {padding: 0.25rem 0.5rem;}
