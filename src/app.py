@@ -1041,14 +1041,22 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
             "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
         })
 
-    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    # Explicit RGB mode — some Pillow builds return a mode-less array wrapper
+    # that fabric.js chokes on silently (renders a blank canvas with no
+    # background). Reopening the RGB view is cheap and forces a known mode.
+    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
     canvas_key = f"axis_pick_{img_key}"
     result = st_canvas(
         fill_color="#e74c3c",
         stroke_color="#000000",
         stroke_width=2,
         background_image=pil_bg,
-        update_streamlit=False,          # avoid mid-drag reruns
+        # Was False here to avoid mid-drag reruns, but that combined with
+        # transform mode + an initial_drawing seems to prevent the canvas
+        # iframe from mounting the background on Streamlit 1.40 + drawable-
+        # canvas 0.9.3. update_streamlit=True is what the point editor uses,
+        # and it renders reliably — Save button below still commits atomically.
+        update_streamlit=True,
         height=canvas_h, width=canvas_w,
         drawing_mode="transform",
         initial_drawing={"version": "4.4.0", "objects": initial_objects},
