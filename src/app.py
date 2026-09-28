@@ -1046,14 +1046,6 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
     # background). Reopening the RGB view is cheap and forces a known mode.
     pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
 
-    # Show the plain image right above the canvas as a fallback / sanity check
-    # — this ALWAYS renders, so users can at least see the chart even if the
-    # canvas iframe fails to mount on their browser.
-    with st.container():
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
-                 caption=f"Chart preview ({W}×{H})",
-                 width=min(canvas_w, 700))
-
     canvas_key = f"axis_pick_{img_key}"
     try:
         result = st_canvas(
@@ -1079,8 +1071,43 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
         "Enter the DATA VALUE each dragged marker represents, then Save."
     )
 
+    # ---- Live position readout ----
+    # After each drag, the canvas reports new object positions on the next
+    # Streamlit rerun. Show them here so users can see where each marker
+    # actually is (pixel coords + provisional data-space using existing
+    # calibration) without having to guess.
+    if result and result.json_data:
+        objs = result.json_data.get("objects", []) or []
+        if len(objs) >= 4:
+            cur_positions = []
+            for i in range(4):
+                obj = objs[i]
+                left = float(obj.get("left", 0))
+                top = float(obj.get("top", 0))
+                ox = obj.get("originX", "left")
+                oy = obj.get("originY", "top")
+                radius = float(obj.get("radius", 0))
+                cx = left if ox == "center" else (left + radius)
+                cy = top if oy == "center" else (top + radius)
+                ix, iy = to_image(cx, cy)
+                data_x, data_y = _pixel_to_data(ix, iy, axis_config)
+                cur_positions.append((ix, iy, data_x, data_y))
+            _label = ["🔴 X1", "🔴 X2", "🔵 Y1", "🔵 Y2"]
+            with st.expander("Current marker positions (updates as you drag)",
+                             expanded=False):
+                for i, (ix, iy, dx, dy) in enumerate(cur_positions):
+                    st.write(
+                        f"{_label[i]}: pixel `({ix:.0f}, {iy:.0f})` — "
+                        f"current calibration says this pixel is "
+                        f"X≈`{dx:.3g}`, Y≈`{dy:.3g}`"
+                    )
+                st.caption(
+                    "Use these as a reference for what value to type below "
+                    "(e.g. drag the Y2 dot to the 250 tick, then type 250)."
+                )
+
     # Value inputs for the 4 markers — pre-filled with current calibration.
-    st.markdown("**Data values at each dragged marker:**")
+    st.markdown("**Data values at each dragged marker (type manually):**")
     vc1, vc2 = st.columns(2)
     with vc1:
         v_x1 = st.number_input(
