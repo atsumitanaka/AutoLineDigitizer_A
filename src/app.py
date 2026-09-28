@@ -722,14 +722,22 @@ def _render_sidebar():
 
 
 def _load_models(config):
-    """Load LineFormer (required) + ChartDete (optional); return both."""
+    """Load LineFormer (required) + ChartDete (optional); return both.
+
+    Non-fatal on missing weights so the 🧠 Models tab stays reachable and the
+    user can download from within the app instead of hitting a hard stop.
+    """
+    infer_module = None
     with st.spinner("Loading LineFormer model..."):
         try:
             infer_module = load_lineformer_model()
             st.sidebar.success("LineFormer loaded!")
-        except Exception as e:
-            st.error(f"Failed to load LineFormer: {e}")
-            st.stop()
+        except FileNotFoundError as e:
+            st.sidebar.error("LineFormer weights not found — see 🧠 Models.")
+            st.sidebar.caption(str(e))
+        except Exception as e:  # noqa: BLE001
+            st.sidebar.error("LineFormer load failed — see 🧠 Models.")
+            st.sidebar.caption(str(e))
 
     chartdete_module = None
     if config["auto_axis"]:
@@ -738,7 +746,7 @@ def _load_models(config):
                 chartdete_module = load_chartdete_model()
                 st.sidebar.success("ChartDete loaded!")
             except Exception as e:
-                st.warning(f"ChartDete not available: {e}")
+                st.sidebar.warning(f"ChartDete not available: {e}")
                 config["auto_axis"] = False
     return infer_module, chartdete_module
 
@@ -1244,6 +1252,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
 
 def single_image_tab(infer_module, chartdete_module, config):
     """Tab 1: single chart image → line extraction (the original workflow)."""
+    if infer_module is None:
+        st.warning("⚠️ LineFormer weights are missing. Open the 🧠 Models tab "
+                   "and download them first.")
+        return
     st.markdown("Upload a chart image (or paste from the clipboard) to extract line data.")
     img, name = _get_input_image(key_prefix="single")
     if img is not None:
@@ -1252,6 +1264,10 @@ def single_image_tab(infer_module, chartdete_module, config):
 
 def pdf_gallery_tab(infer_module, chartdete_module, config):
     """Tab 2: upload a PDF, gallery-select figures, digitize per figure."""
+    if infer_module is None:
+        st.warning("⚠️ LineFormer weights are missing. Open the 🧠 Models tab "
+                   "and download them first.")
+        return
     st.markdown("Upload a paper PDF — every chart figure is detected and shown as a gallery.")
     try:
         import pdf_figures  # noqa: F401
@@ -1399,6 +1415,340 @@ def starrydata_tab():
         url = st.text_input("Starrydata3 URL", value="", key="sd3_url")
         key = st.text_input("API key", value="", type="password", key="sd3_key")
         st.caption("Full Starrydata3 upload flow will be wired here — coming in a follow-up.")
+
+
+# -----------------------------------------------------------------------------
+# Model registry + GitHub Release download / update check
+# -----------------------------------------------------------------------------
+MODELS_DIR = os.path.join(_project_root, "models")
+# Canonical cache is the macOS "Application Support" folder — the models/
+# directory in the repo holds symlinks into it, so downloads land in one place
+# even when the same weights are reused by other tools (e.g. the packaged .app).
+MODELS_CACHE_DIR = os.path.expanduser(
+    "~/Library/Application Support/AutoLineDigitizer/models"
+)
+MODEL_REGISTRY = {
+    "lineformer_general": {
+        "name": "LineFormer (general)",
+        "role": "Line extraction",
+        "filename": "iter_3000.pth",
+        "required": True,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+    "chartdete": {
+        "name": "ChartDete",
+        "role": "Axis detection",
+        "filename": "checkpoint.pth",
+        "required": True,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+    "lineformer_battery_finetuned": {
+        "name": "LineFormer (battery finetuned)",
+        "role": "Line extraction — optimised for battery charge curves",
+        "filename": "lineformer_battery_finetuned.pth",
+        "required": False,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+    "lineformer_battery_realistic": {
+        "name": "LineFormer (battery realistic)",
+        "role": "Line extraction — battery variant",
+        "filename": "lineformer_battery_realistic.pth",
+        "required": False,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+    "lineformer_general_alt": {
+        "name": "LineFormer (general, alt)",
+        "role": "Line extraction — general v2 variant",
+        "filename": "lineformer_general.pth",
+        "required": False,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+    "lineformer_200k": {
+        "name": "LineFormer (200k iterations)",
+        "role": "Line extraction — 200k iter checkpoint",
+        "filename": "lf_200k_iter9500.pth",
+        "required": False,
+        "github_repo": "adityaaa-IIT-BHU/AutoLineDigitizer",
+        "release_tag": "models",
+    },
+}
+
+
+def _model_local_path(model_key):
+    m = MODEL_REGISTRY[model_key]
+    return os.path.join(MODELS_CACHE_DIR, m["filename"])
+
+
+def _model_local_info(model_key):
+    p = _model_local_path(model_key)
+    if not os.path.exists(p):
+        return {"present": False}
+    st_ = os.stat(p)
+    return {
+        "present": True,
+        "path": p,
+        "size": st_.st_size,
+        "mtime": datetime.fromtimestamp(st_.st_mtime),
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_release_info(repo, tag):
+    """Query GitHub Releases API and cache for 30 min.
+
+    Unauthenticated calls are rate-limited to 60/hour per IP — we cache to
+    stay well under that. Returns (info, error_str)."""
+    import urllib.request
+    api = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    req = urllib.request.Request(
+        api,
+        headers={"Accept": "application/vnd.github+json",
+                 "User-Agent": "AutoLineDigitizer-webapp"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        assets = {a["name"]: a for a in data.get("assets", [])}
+        return {
+            "name": data.get("name", tag),
+            "tag": data.get("tag_name", tag),
+            "published_at": data.get("published_at"),
+            "html_url": data.get("html_url", ""),
+            "assets": assets,
+        }, None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+def _fmt_mb(n_bytes):
+    return f"{n_bytes / (1024*1024):.1f} MB"
+
+
+def _download_with_progress(url, dest_path, progress_bar, status_text):
+    """Streaming download with periodic st.progress updates."""
+    import urllib.request
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    tmp_path = dest_path + ".part"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "AutoLineDigitizer-webapp"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        chunk = 1024 * 512  # 512 KB
+        with open(tmp_path, "wb") as f:
+            while True:
+                data = r.read(chunk)
+                if not data:
+                    break
+                f.write(data)
+                got += len(data)
+                if total:
+                    progress_bar.progress(min(1.0, got / total))
+                    status_text.text(
+                        f"Downloading {_fmt_mb(got)} / {_fmt_mb(total)} "
+                        f"({100 * got / total:.1f}%)"
+                    )
+                else:
+                    status_text.text(f"Downloading {_fmt_mb(got)}…")
+    os.replace(tmp_path, dest_path)
+    # Keep a symlink inside <repo>/models/ so app.py finds it via the fixed path.
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    link_path = os.path.join(MODELS_DIR, os.path.basename(dest_path))
+    if os.path.islink(link_path) or os.path.exists(link_path):
+        try:
+            os.remove(link_path)
+        except IsADirectoryError:
+            pass
+    try:
+        os.symlink(dest_path, link_path)
+    except OSError:
+        pass  # link creation is best-effort; app.py still finds the cache path
+
+
+def _iter_missing_required_models():
+    for key, m in MODEL_REGISTRY.items():
+        if m["required"] and not _model_local_info(key)["present"]:
+            yield key, m
+
+
+def _iter_updates_available():
+    """Yield model_key, local_info, remote_asset for models where sizes differ
+    (proxy for 'a newer weights file has been published upstream')."""
+    seen_releases = {}
+    for key, m in MODEL_REGISTRY.items():
+        local = _model_local_info(key)
+        if not local["present"]:
+            continue
+        cache_key = (m["github_repo"], m["release_tag"])
+        if cache_key not in seen_releases:
+            info, _err = _fetch_release_info(*cache_key)
+            seen_releases[cache_key] = info
+        info = seen_releases[cache_key]
+        if not info:
+            continue
+        asset = info["assets"].get(m["filename"])
+        if not asset:
+            continue
+        remote_size = int(asset.get("size", 0))
+        if remote_size and remote_size != local["size"]:
+            yield key, local, asset, info
+
+
+def models_tab():
+    """Tab 6: model registry — show local vs upstream, notify updates, download."""
+    st.markdown("Manage the ML weights AutoLineDigitizer uses. Weights are "
+                "cached under `~/Library/Application Support/AutoLineDigitizer/"
+                "models/` and symlinked into the repo's `models/` folder.")
+
+    if st.button("↻ Refresh upstream info", key="mdl_refresh"):
+        _fetch_release_info.clear()
+        st.rerun()
+
+    # Group by upstream release so we only call the API once per release.
+    seen_releases = {}
+    for key, m in MODEL_REGISTRY.items():
+        rel_key = (m["github_repo"], m["release_tag"])
+        seen_releases.setdefault(rel_key, None)
+    for rel_key in list(seen_releases):
+        info, err = _fetch_release_info(*rel_key)
+        seen_releases[rel_key] = (info, err)
+
+    for key, m in MODEL_REGISTRY.items():
+        local = _model_local_info(key)
+        info, err = seen_releases[(m["github_repo"], m["release_tag"])]
+        asset = info["assets"].get(m["filename"]) if info else None
+
+        with st.container(border=True):
+            hdr_col, action_col = st.columns([4, 1])
+            with hdr_col:
+                badge = "🔴 required" if m["required"] else "⚪ optional"
+                st.markdown(f"### {m['name']} · {badge}")
+                st.caption(f"{m['role']} — `{m['filename']}`")
+
+            # Local status
+            if local["present"]:
+                st.markdown(
+                    f"**Local:** ✅ present · {_fmt_mb(local['size'])} · "
+                    f"downloaded {local['mtime'].strftime('%Y-%m-%d %H:%M')}"
+                )
+            else:
+                st.markdown("**Local:** ❌ not installed")
+
+            # Upstream status
+            if err:
+                st.warning(f"Upstream check failed: {err}")
+            elif not info:
+                st.caption("Upstream info unavailable.")
+            elif not asset:
+                st.caption(
+                    f"Upstream release '{info['name']}' has no asset called "
+                    f"`{m['filename']}` — you may need a manual URL."
+                )
+            else:
+                pub = asset.get("updated_at", info.get("published_at", ""))
+                pub_short = (pub or "")[:10]
+                st.markdown(
+                    f"**Upstream:** [{info['name']}]({info['html_url']}) · "
+                    f"{_fmt_mb(int(asset.get('size', 0)))} · "
+                    f"published {pub_short}"
+                )
+
+                # Update / install decision
+                if not local["present"]:
+                    status = "❌ Not installed — click Download."
+                elif int(asset.get("size", 0)) == local["size"]:
+                    status = "✅ Up to date."
+                else:
+                    status = ("⚠️ **Newer version available upstream** "
+                              f"(remote {_fmt_mb(int(asset.get('size', 0)))}, "
+                              f"local {_fmt_mb(local['size'])}).")
+                st.markdown(status)
+
+            with action_col:
+                label = ("⬇ Re-download" if local["present"]
+                         else "⬇ Download")
+                if st.button(label, key=f"mdl_dl_{key}",
+                             disabled=(asset is None),
+                             type="primary" if not local["present"] else "secondary"):
+                    dest = _model_local_path(key)
+                    prog = st.progress(0.0)
+                    stat = st.empty()
+                    try:
+                        _download_with_progress(asset["browser_download_url"],
+                                                dest, prog, stat)
+                        stat.success(f"Downloaded {m['filename']}.")
+                        # Invalidate cached model loaders so a fresh weight is picked up.
+                        try:
+                            load_lineformer_model.clear()
+                            load_chartdete_model.clear()
+                        except Exception:
+                            pass
+                        st.rerun()
+                    except Exception as e:
+                        stat.error(f"Download failed: {e}")
+
+    st.divider()
+    st.caption(
+        "**Cache size:** " + _fmt_mb(sum(
+            _model_local_info(k)["size"]
+            for k in MODEL_REGISTRY if _model_local_info(k)["present"]
+        )) + f" total across {sum(1 for k in MODEL_REGISTRY if _model_local_info(k)['present'])} file(s)."
+    )
+    if st.button("🗑 Purge all cached models (frees disk)", key="mdl_purge"):
+        removed = []
+        for k, m in MODEL_REGISTRY.items():
+            p = _model_local_path(k)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed.append(m["filename"])
+                except Exception as e:
+                    st.error(f"Failed to remove {p}: {e}")
+        # Also remove dangling symlinks in repo models/.
+        for name in os.listdir(MODELS_DIR):
+            if name.endswith(".pth"):
+                try:
+                    os.remove(os.path.join(MODELS_DIR, name))
+                except Exception:
+                    pass
+        try:
+            load_lineformer_model.clear()
+            load_chartdete_model.clear()
+        except Exception:
+            pass
+        if removed:
+            st.success(f"Removed: {', '.join(removed)}")
+            st.rerun()
+
+
+def _render_update_banner():
+    """Small header banner: notify if required models are missing or upstream
+    has newer weights. Runs on every rerun but the GitHub call is cached."""
+    missing = list(_iter_missing_required_models())
+    if missing:
+        names = ", ".join(m["name"] for _, m in missing)
+        st.error(
+            f"⚠️ Missing required model(s): **{names}**. "
+            "Open the 🧠 Models tab to download."
+        )
+        return
+
+    try:
+        updates = list(_iter_updates_available())
+    except Exception:
+        updates = []
+    if updates:
+        names = ", ".join(MODEL_REGISTRY[k]["name"] for k, *_ in updates)
+        st.info(
+            f"🆕 A newer version is available for: **{names}**. "
+            "Open the 🧠 Models tab to update."
+        )
 
 
 def vlm_kmds_tab():
@@ -1629,15 +1979,22 @@ def main():
                "[StarryDigitizer](https://starrydigitizer.vercel.app/) and "
                "[WebPlotDigitizer](https://apps.automeris.io/wpd4/).")
 
+    # Header-level notice for missing or outdated weights — checked before the
+    # sidebar loads models so users see the ⚠️ before Streamlit tries to import
+    # a checkpoint that doesn't exist yet.
+    _render_update_banner()
+
     config = _render_sidebar()
     infer_module, chartdete_module = _load_models(config)
 
-    tab_single, tab_pdf, tab_scatter, tab_sd, tab_vlm = st.tabs([
+    (tab_single, tab_pdf, tab_scatter, tab_sd, tab_vlm,
+     tab_models) = st.tabs([
         "📈 Single Image",
         "📄 PDF Gallery",
         "⚫ Scatter",
         "☁️ Starrydata",
         "✨ Claude + KMDS",
+        "🧠 Models",
     ])
     with tab_single:
         single_image_tab(infer_module, chartdete_module, config)
@@ -1649,6 +2006,8 @@ def main():
         starrydata_tab()
     with tab_vlm:
         vlm_kmds_tab()
+    with tab_models:
+        models_tab()
 
 
 if __name__ == "__main__":
