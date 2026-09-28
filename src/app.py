@@ -1163,6 +1163,20 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                             key=f"ax_ylog_{img_bytes_key}",
                         )
 
+                    # Live readout so the user can confirm the values that will
+                    # be applied — changing only the value (not the pixel)
+                    # doesn't visually move the marker on the chart, so this
+                    # panel is the primary "did my edit take?" feedback.
+                    st.markdown(
+                        "**Pending calibration (will apply on click):**\n\n"
+                        f"- X: `{nx1v:g}` @ px `{nx1p}` → "
+                        f"`{nx2v:g}` @ px `{nx2p}`\n"
+                        f"- Y: `{ny1v:g}` @ py `{ny1p}` → "
+                        f"`{ny2v:g}` @ py `{ny2p}`\n"
+                        f"- Log scales: X={'on' if nxlog else 'off'}, "
+                        f"Y={'on' if nylog else 'off'}"
+                    )
+
                     apply_col, reset_col, _ = st.columns([1, 1, 3])
                     with apply_col:
                         if st.button("💾 Apply calibration",
@@ -1184,6 +1198,12 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                                 "yIsLogScale": bool(nylog),
                             })
                             st.session_state[ax_key] = (new_axis, detections, ocr_results)
+                            # Auto-enable value labels on the chart so the user
+                            # can visually confirm that a value-only edit (e.g.
+                            # Y2: 200 → 250 with pixel unchanged) actually
+                            # landed — otherwise the marker sits in the same
+                            # pixel and looks like nothing happened.
+                            st.session_state["_show_values_after_apply"] = True
                             # Bump rev so the XY table (which converts pixels via
                             # this calibration) is forced to refresh from source.
                             st.session_state[rev_key] = rev + 1
@@ -1278,11 +1298,16 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             highlight = idx
 
         # Re-render viz with selection + numbers baked in.
+        # Sticky "burn values after Apply" flag: once the user edits
+        # calibration, keep values visible so subsequent value-only edits
+        # remain visible; sidebar toggle still overrides when explicitly set.
+        show_vals = (config.get("show_calibration_values", False)
+                     or st.session_state.get("_show_values_after_apply", False))
         if show_visualization:
             result_img = draw_points_on_image(
                 img, viz_data, axis_config,
                 show_calibration=config.get("show_calibration", True),
-                show_calibration_values=config.get("show_calibration_values", False),
+                show_calibration_values=show_vals,
                 show_line_numbers=True,
                 highlight_idx=highlight,
                 line_indices=viz_indices,
