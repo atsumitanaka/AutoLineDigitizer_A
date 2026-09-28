@@ -1254,38 +1254,30 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                 title = ("Axis Calibration (Auto-detected — click to edit)"
                          if detections is not None
                          else "Axis Calibration (Manual — auto-detection unavailable)")
+                # Drag picker at TOP level — st_canvas can't reliably mount
+                # its iframe when nested under expander -> tabs, so we keep it
+                # a sibling of the Axis Calibration expander instead.
+                with st.expander("🎯 Drag calibration markers on chart",
+                                 expanded=False):
+                    st.caption(
+                        "Drag each dot to the tick it represents, enter the "
+                        "corresponding data value, then press **Save**. "
+                        "Red = X axis, Blue = Y axis."
+                    )
+                    _render_axis_picker(img, axis_config, ax_key,
+                                        img_bytes_key, detections, ocr_results)
+
                 with st.expander(title, expanded=(detections is None)):
-                    # Streamlit forbids nested expanders, so tabs split the two
-                    # calibration workflows: drag markers on the chart, or type
-                    # the values/pixels in numeric fields.
                     st.info(
-                        "Two ways to fix the calibration:\n\n"
-                        "🎯 **Drag markers** — moves where a tick point IS "
-                        "on the chart (updates pixel positions).\n\n"
                         "🔢 **Numeric edit** — declares what each marker "
-                        "REPRESENTS (updates data-space values). "
-                        "⚠️ This does NOT move the marker on the chart.",
+                        "REPRESENTS (data-space values) and lets you type "
+                        "exact pixel positions. ⚠️ Value edits alone do NOT "
+                        "visually move the marker on the chart — use the "
+                        "**🎯 Drag calibration markers on chart** expander "
+                        "above for that.",
                         icon="ℹ️",
                     )
-                    pick_tab, num_tab = st.tabs([
-                        "🎯 Drag markers  (move on chart)",
-                        "🔢 Numeric edit  (change values / advanced pixels)",
-                    ])
-                    with pick_tab:
-                        st.caption(
-                            "Use this when auto-detection put the markers on "
-                            "the wrong ticks. Drag each dot to the tick it "
-                            "represents, then press **Save axis positions**. "
-                            "This updates the pixel positions in one step so "
-                            "the numeric fields stay consistent with what's "
-                            "on the chart."
-                        )
-                        _render_axis_picker(img, axis_config, ax_key,
-                                            img_bytes_key, detections, ocr_results)
-
-                    # The remainder of this expander (numeric form + Apply) is
-                    # rendered inside num_tab so the two views stay side-by-side.
-                    with num_tab:
+                    if True:
                         # Prefill from current axis_config values.
                         st.caption("Change the tick values (data-space) or the "
                                    "pixel positions of the four calibration points. "
