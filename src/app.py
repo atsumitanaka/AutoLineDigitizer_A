@@ -892,7 +892,11 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     else:  # move
         drawing_mode = "transform"
 
+    # Resize the background to exact canvas dims — same fix as the axis
+    # picker: a natural-size PIL image is cropped, not scaled, and the
+    # data-URL load race sometimes leaves the canvas blank.
     pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+    pil_bg = pil_bg.resize((canvas_w, canvas_h), PILImage.LANCZOS)
     # update_streamlit=True everywhere: with False the canvas keeps its
     # dragged state client-side but never reports it to Streamlit, so
     # Save moves saw the stale initial positions and reported "no change".
@@ -1055,10 +1059,14 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
             "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
         })
 
-    # Explicit RGB mode — some Pillow builds return a mode-less array wrapper
-    # that fabric.js chokes on silently (renders a blank canvas with no
-    # background). Reopening the RGB view is cheap and forces a known mode.
+    # Pre-resize the background to exactly the canvas dimensions.
+    # streamlit-drawable-canvas ships the PIL image as a data URL; if the
+    # image is at natural size (larger than the canvas), fabric.js crops
+    # instead of scaling, and any race in the data-URL load leaves the
+    # background blank — the "sometimes shows, sometimes doesn't" flicker.
+    # Explicit RGB mode + exact resize = deterministic mount.
     pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+    pil_bg = pil_bg.resize((canvas_w, canvas_h), PILImage.LANCZOS)
 
     canvas_key = f"axis_pick_{img_key}"
     try:
