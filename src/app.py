@@ -1144,25 +1144,35 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         # Placeholder for axis calibration results (outside columns)
         axis_placeholder = st.empty()
 
-        # Step 1: Extract lines (faster) - with spinner
-        with status_placeholder.container():
-            with st.spinner("⏳ Extracting lines (LineFormer)..."):
-                data_series, raw_lines = extract_lines(
-                    infer_module, img, downsample_mode, fixed_step, max_points
-                )
-
-                # Sort lines
-                data_series = sort_data_series(data_series, sort_mode)
-
-        # ---- Session-state per image: preserve user edits across reruns ----
+        # ---- Session-state per image: preserve extraction + user edits ----
         img_bytes_key = hashlib.md5(img.tobytes()).hexdigest()[:12]
         ss_key = f"series_{img_bytes_key}"
         ax_key = f"axis_{img_bytes_key}"
+        rev_key = f"rev_{img_bytes_key}"
+        # Raw extraction cache keyed by (image, extraction params). This is the
+        # important fix — LineFormer inference used to fire on every rerun,
+        # even when nothing had changed, so every canvas click / Apply / mode
+        # switch re-ran a 5-15 s pipeline and the Extraction Result appeared to
+        # "blink" as the spinner and result alternated.
+        raw_key = (f"raw_{img_bytes_key}_{downsample_mode}_"
+                   f"{fixed_step}_{max_points}_{sort_mode}")
+
+        if raw_key not in st.session_state:
+            # First time we've seen this image (or a params change) — run the
+            # pipeline once and cache the sorted series.
+            with status_placeholder.container():
+                with st.spinner("⏳ Extracting lines (LineFormer)…"):
+                    data_series, _raw_lines = extract_lines(
+                        infer_module, img, downsample_mode, fixed_step, max_points
+                    )
+                    data_series = sort_data_series(data_series, sort_mode)
+            st.session_state[raw_key] = data_series
+        data_series = st.session_state[raw_key]
+
         # A monotonically increasing revision the visual editor / axis editor
         # bump whenever they write to session_state — so widgets whose data is
         # driven from outside (data_editor especially, which caches per-key
         # user edits) can be forced to re-instantiate with fresh data.
-        rev_key = f"rev_{img_bytes_key}"
         if ss_key not in st.session_state:
             st.session_state[ss_key] = copy.deepcopy(data_series)
         if rev_key not in st.session_state:
