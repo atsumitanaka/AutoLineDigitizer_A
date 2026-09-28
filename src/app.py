@@ -870,15 +870,22 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         drawing_mode = "transform"  # view: transform mode w/ selectable=False → no-op
 
     pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    # Include mode + point count in the key so canvas resets when mode changes
-    # (otherwise fabric.js keeps stale objects when we swap initial_drawing).
-    canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode[:2]}_{len(pts)}"
+    # For Move mode, disable per-frame Streamlit sync so fabric.js doesn't
+    # get torn down mid-drag by our st.rerun() call (the "fade to white"
+    # flicker Tanaka reported). Add/Delete stay real-time so users see
+    # the point appear/disappear immediately.
+    is_move = mode.startswith("🖐")
+    update_streamlit = not is_move
+    # Key changes on line/mode swap so fabric.js starts clean, but stays
+    # STABLE within a single mode+line — necessary for Move so the widget
+    # doesn't reset mid-drag when session_state momentarily flickers.
+    canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode[:2]}"
     result = st_canvas(
         fill_color=line_css,
         stroke_color=line_css,
         stroke_width=1,
         background_image=pil_bg,
-        update_streamlit=True,
+        update_streamlit=update_streamlit,
         height=canvas_h,
         width=canvas_w,
         drawing_mode=drawing_mode,
@@ -887,6 +894,22 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         point_display_radius=r_pt,
         key=canvas_key,
     )
+
+    # For Move mode, offer a manual save so the drag session is fully
+    # committed to session_state (and thus to the XY table + exports).
+    if is_move:
+        save_col, hint_col = st.columns([1, 4])
+        save_moves = False
+        with save_col:
+            save_moves = st.button("💾 Save moves",
+                                   key=f"vis_savemv_{img_key}_{selected_idx}",
+                                   type="primary")
+        with hint_col:
+            st.caption("Drag as many points as you want, then press **Save moves** "
+                       "to commit. (Auto-sync is off in this mode to prevent the "
+                       "canvas from resetting while you drag.)")
+    else:
+        save_moves = False
 
     if not result or not result.json_data:
         return
@@ -948,8 +971,9 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
             new_pts = [[int(round(p[0])), int(round(p[1]))] for p in surviving]
             changed = True
     elif mode.startswith("🖐"):
-        # Same object count but positions may have moved via drag.
-        if len(canvas_pts) == len(pts):
+        # Only commit when the user explicitly presses Save moves — otherwise
+        # every micro-drag would trigger st.rerun() and tear down fabric.js.
+        if save_moves and len(canvas_pts) == len(pts):
             moved = [[int(round(p[0])), int(round(p[1]))] for p in canvas_pts]
             moved.sort(key=lambda p: p[0])
             if moved != [list(x) for x in pts]:
