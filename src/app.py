@@ -844,7 +844,27 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     def to_image(cx, cy):
         return cx / scale, cy / scale
 
+    is_view = mode.startswith("👁")
+    is_move = mode.startswith("🖐")
+    is_add = mode.startswith("➕")
+    is_delete = mode.startswith("❌")
+
+    # ---- View mode: render a static image with points drawn on it. No
+    # canvas at all so nothing can be accidentally dragged. ----
+    if is_view:
+        static = img.copy()
+        color_bgr = tuple(int(c) for c in palette[selected_idx % len(palette)])
+        for (px, py) in pts:
+            cv2.circle(static, (int(px), int(py)), r_pt, color_bgr, -1)
+            cv2.circle(static, (int(px), int(py)), r_pt, (0, 0, 0), 1)
+        st.image(cv2.cvtColor(static, cv2.COLOR_BGR2RGB),
+                 use_container_width=True)
+        return
+
     # Pre-populate the canvas with the current points as fabric.js circles.
+    # Movement is only enabled in Move mode; Add/Delete keep the initial
+    # objects fully locked so a stray drag can't reshape the line.
+    can_drag = is_move
     initial_objects = []
     for i, (px, py) in enumerate(pts):
         cx, cy = to_canvas(px, py)
@@ -856,36 +876,36 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
             "fill": line_css,
             "stroke": "#000000",
             "strokeWidth": 1,
-            "selectable": mode.startswith("🖐"),
-            "hasControls": False,     # no resize handles
-            "hasBorders": mode.startswith("🖐"),
-            "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
+            "selectable": can_drag,
+            "evented": can_drag,
+            "hoverCursor": "move" if can_drag else "default",
+            "hasControls": False,
+            "hasBorders": can_drag,
+            "lockRotation": True,
+            "lockScalingX": True, "lockScalingY": True,
+            "lockMovementX": not can_drag,
+            "lockMovementY": not can_drag,
         })
 
-    if mode.startswith("➕") or mode.startswith("❌"):
+    if is_add or is_delete:
         drawing_mode = "point"
-    elif mode.startswith("🖐"):
+    else:  # move
         drawing_mode = "transform"
-    else:
-        drawing_mode = "transform"  # view: transform mode w/ selectable=False → no-op
 
-    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    # For Move mode, disable per-frame Streamlit sync so fabric.js doesn't
-    # get torn down mid-drag by our st.rerun() call (the "fade to white"
-    # flicker Tanaka reported). Add/Delete stay real-time so users see
-    # the point appear/disappear immediately.
-    is_move = mode.startswith("🖐")
-    update_streamlit = not is_move
-    # Key changes on line/mode swap so fabric.js starts clean, but stays
-    # STABLE within a single mode+line — necessary for Move so the widget
-    # doesn't reset mid-drag when session_state momentarily flickers.
+    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+    # update_streamlit=True everywhere: with False the canvas keeps its
+    # dragged state client-side but never reports it to Streamlit, so
+    # Save moves saw the stale initial positions and reported "no change".
+    # The flicker that motivated False before was caused by our own
+    # unconditional st.rerun() — with the auto-save-without-rerun path
+    # below, drags now stick without a full re-mount.
     canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode[:2]}"
     result = st_canvas(
         fill_color=line_css,
         stroke_color=line_css,
         stroke_width=1,
         background_image=pil_bg,
-        update_streamlit=update_streamlit,
+        update_streamlit=True,
         height=canvas_h,
         width=canvas_w,
         drawing_mode=drawing_mode,
@@ -895,21 +915,9 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         key=canvas_key,
     )
 
-    # For Move mode, offer a manual save so the drag session is fully
-    # committed to session_state (and thus to the XY table + exports).
     if is_move:
-        save_col, hint_col = st.columns([1, 4])
-        save_moves = False
-        with save_col:
-            save_moves = st.button("💾 Save moves",
-                                   key=f"vis_savemv_{img_key}_{selected_idx}",
-                                   type="primary")
-        with hint_col:
-            st.caption("Drag as many points as you want, then press **Save moves** "
-                       "to commit. (Auto-sync is off in this mode to prevent the "
-                       "canvas from resetting while you drag.)")
-    else:
-        save_moves = False
+        st.caption("🖐 Drag any point to reposition it. Changes commit "
+                   "automatically after each drag and reach the XY table below.")
 
     if not result or not result.json_data:
         return
@@ -970,10 +978,13 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
                 del surviving[idx]
             new_pts = [[int(round(p[0])), int(round(p[1]))] for p in surviving]
             changed = True
-    elif mode.startswith("🖐"):
-        # Only commit when the user explicitly presses Save moves — otherwise
-        # every micro-drag would trigger st.rerun() and tear down fabric.js.
-        if save_moves and len(canvas_pts) == len(pts):
+    elif is_move:
+        # Every drag release triggers a Streamlit rerun (update_streamlit=True);
+        # if the returned canvas positions differ from what session_state
+        # remembers, commit them. No st.rerun() call — Streamlit already
+        # re-rendered from the canvas event, so mutating session_state now is
+        # enough for the XY table below to see the new points on this render.
+        if len(canvas_pts) == len(pts):
             moved = [[int(round(p[0])), int(round(p[1]))] for p in canvas_pts]
             moved.sort(key=lambda p: p[0])
             if moved != [list(x) for x in pts]:
@@ -983,12 +994,15 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     if changed and new_pts is not None:
         push_undo()
         st.session_state[ss_key][selected_idx]["points"] = new_pts
-        # Force the paired XY table (st.data_editor) to re-read from source by
-        # bumping the shared revision counter — otherwise its cached user edits
-        # override the fresh points we just wrote.
+        # Bump the rev so the data_editor below re-instantiates and picks up
+        # the new points instead of its cached deltas.
         rev_key = f"rev_{img_key}"
         st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
-        st.rerun()
+        # For Add/Delete we still st.rerun() so the canvas re-mounts with the
+        # updated object count. For Move the count is stable, and rerunning
+        # would tear down the fabric.js state mid-interaction.
+        if not is_move:
+            st.rerun()
 
 
 def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_results):
@@ -1572,7 +1586,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             # points that came from a canvas drag or a recalibrated axis.
             edited_df = st.data_editor(
                 df, num_rows="dynamic", use_container_width=True,
-                key=f"editor_{img_bytes_key}_{idx}_r{rev}",
+                # Read rev fresh from session_state so a mid-rerun bump (Move
+                # mode saves without st.rerun) is reflected in the widget key.
+                key=(f"editor_{img_bytes_key}_{idx}_r"
+                     f"{st.session_state.get(rev_key, rev)}"),
                 column_config={c: st.column_config.NumberColumn(c, format="%.6g")
                                for c in cols},
             )
