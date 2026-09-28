@@ -1666,10 +1666,12 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                         # Drop the line entirely.
                         del st.session_state[ss_key][idx]
                         st.session_state.pop(arm_key, None)
-                        # Force the Curves selectbox off this now-missing
-                        # index so we don't crash on the next render.
+                        # Streamlit forbids ASSIGNING to a widget's state
+                        # after it was rendered in the current run, but a
+                        # delete is allowed. On the next rerun the selectbox
+                        # will fall back to its default (index 0 = "all").
                         sel_key = f"curve_sel_{img_bytes_key}"
-                        st.session_state[sel_key] = "all"
+                        st.session_state.pop(sel_key, None)
                         st.session_state[rev_key] = rev + 1
                         st.rerun()
                     if st.button("Cancel",
