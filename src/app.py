@@ -1227,9 +1227,18 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                     # Streamlit forbids nested expanders, so tabs split the two
                     # calibration workflows: drag markers on the chart, or type
                     # the values/pixels in numeric fields.
+                    st.info(
+                        "Two ways to fix the calibration:\n\n"
+                        "🎯 **Drag markers** — moves where a tick point IS "
+                        "on the chart (updates pixel positions).\n\n"
+                        "🔢 **Numeric edit** — declares what each marker "
+                        "REPRESENTS (updates data-space values). "
+                        "⚠️ This does NOT move the marker on the chart.",
+                        icon="ℹ️",
+                    )
                     pick_tab, num_tab = st.tabs([
-                        "🎯 Drag markers on chart",
-                        "🔢 Numeric edit",
+                        "🎯 Drag markers  (move on chart)",
+                        "🔢 Numeric edit  (change values / advanced pixels)",
                     ])
                     with pick_tab:
                         st.caption(
