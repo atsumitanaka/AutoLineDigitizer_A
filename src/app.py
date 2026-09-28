@@ -895,8 +895,17 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     # Resize the background to exact canvas dims — same fix as the axis
     # picker: a natural-size PIL image is cropped, not scaled, and the
     # data-URL load race sometimes leaves the canvas blank.
-    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
-    pil_bg = pil_bg.resize((canvas_w, canvas_h), PILImage.LANCZOS)
+    # Cache the resized PIL in session_state, keyed by (img hash, canvas dims),
+    # so its Python object identity is stable across reruns. Building a fresh
+    # PIL every render was making streamlit-drawable-canvas re-decode the
+    # data URL on every st.rerun() after a Delete click, and the race left
+    # the fabric.js canvas with markers but no background image.
+    bg_cache_key = f"vis_bg_{img_key}_{canvas_w}x{canvas_h}"
+    if bg_cache_key not in st.session_state:
+        _tmp = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+        st.session_state[bg_cache_key] = _tmp.resize(
+            (canvas_w, canvas_h), PILImage.LANCZOS)
+    pil_bg = st.session_state[bg_cache_key]
     # update_streamlit=True everywhere: with False the canvas keeps its
     # dragged state client-side but never reports it to Streamlit, so
     # Save moves saw the stale initial positions and reported "no change".
@@ -1059,14 +1068,18 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
             "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
         })
 
-    # Pre-resize the background to exactly the canvas dimensions.
-    # streamlit-drawable-canvas ships the PIL image as a data URL; if the
-    # image is at natural size (larger than the canvas), fabric.js crops
-    # instead of scaling, and any race in the data-URL load leaves the
-    # background blank — the "sometimes shows, sometimes doesn't" flicker.
-    # Explicit RGB mode + exact resize = deterministic mount.
-    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
-    pil_bg = pil_bg.resize((canvas_w, canvas_h), PILImage.LANCZOS)
+    # Pre-resize the background to exactly the canvas dimensions AND cache
+    # it in session_state so its Python object identity is stable across
+    # reruns. Building a fresh PIL each render was forcing streamlit-drawable-
+    # canvas to re-decode the data URL every time; combined with a rerun (e.g.
+    # a Delete click), the frontend sometimes ended up with markers but no
+    # background image — a race between fabric.js mount and image decode.
+    bg_cache_key = f"axpick_bg_{img_key}_{canvas_w}x{canvas_h}"
+    if bg_cache_key not in st.session_state:
+        _tmp = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+        st.session_state[bg_cache_key] = _tmp.resize(
+            (canvas_w, canvas_h), PILImage.LANCZOS)
+    pil_bg = st.session_state[bg_cache_key]
 
     canvas_key = f"axis_pick_{img_key}"
     try:
