@@ -1510,25 +1510,35 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         # ---- Per-curve inspection & editing ----
         st.subheader("Curves")
         legend_names = st.session_state.get(f"legend_names_{img_bytes_key}", [])
-        curve_labels = ["All curves"]
-        for i, s in enumerate(edited_series):
+        # Options are stable identifiers ("all" or int line index) so the
+        # selection survives when a line's point count changes mid-session
+        # (e.g. Delete mode removed a point). Point count is shown only via
+        # format_func, not baked into the option value itself.
+        options = ["all"] + list(range(len(edited_series)))
+
+        def _curve_label(opt):
+            if opt == "all":
+                return "All curves"
+            i = opt
             nm = (legend_names[i] if i < len(legend_names) and legend_names[i]
                   else None)
-            label = f"Line {i+1}" + (f" — {nm}" if nm else "") + f" ({len(s['points'])} pts)"
-            curve_labels.append(label)
+            base = f"Line {i+1}" + (f" — {nm}" if nm else "")
+            return f"{base}  ({len(edited_series[i]['points'])} pts)"
+
         sel = st.selectbox(
-            "Show", curve_labels, index=0,
+            "Show", options, index=0,
+            format_func=_curve_label,
             key=f"curve_sel_{img_bytes_key}",
             help="Pick a single line to isolate it in the visualization and "
                  "edit its X/Y points below.",
         )
 
-        if sel == "All curves":
+        if sel == "all":
             viz_data = edited_series
             viz_indices = list(range(len(edited_series)))
             highlight = None
         else:
-            idx = curve_labels.index(sel) - 1
+            idx = int(sel)
             viz_data = [edited_series[idx]]
             viz_indices = [idx]
             highlight = idx
@@ -1553,8 +1563,8 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                                   use_container_width=True)
 
         # Visual editor + XY table for the selected single curve.
-        if sel != "All curves":
-            idx = curve_labels.index(sel) - 1
+        if sel != "all":
+            idx = int(sel)
 
             # Rebuild the color palette so the visual editor matches the
             # numbered chart above.
