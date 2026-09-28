@@ -971,21 +971,119 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         else:
             status_placeholder.empty()
 
-        # Show axis calibration results
+        # ---- Axis calibration: editable ----
+        H_img, W_img = img.shape[:2]
+        # Seed a manual calibration if auto-detection failed / was disabled.
+        if axis_config is None and ax_key not in st.session_state:
+            axis_config = {
+                "x1_px": W_img * 0.10, "x1_py": H_img * 0.90, "x1_val": 0.0,
+                "x2_px": W_img * 0.90, "x2_py": H_img * 0.90, "x2_val": 1.0,
+                "y1_px": W_img * 0.10, "y1_py": H_img * 0.90, "y1_val": 0.0,
+                "y2_px": W_img * 0.10, "y2_py": H_img * 0.10, "y2_val": 1.0,
+                "xIsLogScale": False, "yIsLogScale": False,
+            }
+            st.session_state[ax_key] = (axis_config, None, None)
+
         if axis_config is not None:
             with axis_placeholder.container():
-                with st.expander("Axis Calibration (Auto-detected)", expanded=False):
-                    col_x, col_y = st.columns(2)
-                    with col_x:
-                        st.markdown("**X-axis:**")
-                        st.write(f"  {axis_config['x1_val']} → {axis_config['x2_val']}")
-                    with col_y:
-                        st.markdown("**Y-axis:**")
-                        st.write(f"  {axis_config['y1_val']} → {axis_config['y2_val']}")
+                title = ("Axis Calibration (Auto-detected — click to edit)"
+                         if detections is not None
+                         else "Axis Calibration (Manual — auto-detection unavailable)")
+                with st.expander(title, expanded=(detections is None)):
+                    # Prefill from current axis_config values.
+                    st.caption("Change the tick values (data-space) or the "
+                               "pixel positions of the four calibration points. "
+                               "Press **Apply calibration** to redraw and "
+                               "re-export.")
+                    xc1, xc2 = st.columns(2)
+                    with xc1:
+                        st.markdown("**X-axis**")
+                        nx1v = st.number_input(
+                            "X1 value (left tick)",
+                            value=float(axis_config["x1_val"]),
+                            key=f"ax_x1v_{img_bytes_key}", format="%.6g",
+                        )
+                        nx2v = st.number_input(
+                            "X2 value (right tick)",
+                            value=float(axis_config["x2_val"]),
+                            key=f"ax_x2v_{img_bytes_key}", format="%.6g",
+                        )
+                        nx1p = st.number_input(
+                            "X1 pixel (from left)", min_value=0, max_value=W_img,
+                            value=int(round(float(axis_config["x1_px"]))),
+                            key=f"ax_x1p_{img_bytes_key}",
+                        )
+                        nx2p = st.number_input(
+                            "X2 pixel (from left)", min_value=0, max_value=W_img,
+                            value=int(round(float(axis_config["x2_px"]))),
+                            key=f"ax_x2p_{img_bytes_key}",
+                        )
+                        nxlog = st.checkbox(
+                            "X-axis is log scale",
+                            value=bool(axis_config.get("xIsLogScale", False)),
+                            key=f"ax_xlog_{img_bytes_key}",
+                        )
+                    with xc2:
+                        st.markdown("**Y-axis**")
+                        ny1v = st.number_input(
+                            "Y1 value (bottom tick)",
+                            value=float(axis_config["y1_val"]),
+                            key=f"ax_y1v_{img_bytes_key}", format="%.6g",
+                        )
+                        ny2v = st.number_input(
+                            "Y2 value (top tick)",
+                            value=float(axis_config["y2_val"]),
+                            key=f"ax_y2v_{img_bytes_key}", format="%.6g",
+                        )
+                        # y1_py is the bottom (higher pixel), y2_py the top (lower pixel)
+                        ny1p = st.number_input(
+                            "Y1 pixel (from top, larger = lower on chart)",
+                            min_value=0, max_value=H_img,
+                            value=int(round(float(axis_config["y1_py"]))),
+                            key=f"ax_y1p_{img_bytes_key}",
+                        )
+                        ny2p = st.number_input(
+                            "Y2 pixel (from top, smaller = higher on chart)",
+                            min_value=0, max_value=H_img,
+                            value=int(round(float(axis_config["y2_py"]))),
+                            key=f"ax_y2p_{img_bytes_key}",
+                        )
+                        nylog = st.checkbox(
+                            "Y-axis is log scale",
+                            value=bool(axis_config.get("yIsLogScale", False)),
+                            key=f"ax_ylog_{img_bytes_key}",
+                        )
 
-                    # Show OCR details
+                    apply_col, reset_col, _ = st.columns([1, 1, 3])
+                    with apply_col:
+                        if st.button("💾 Apply calibration",
+                                     key=f"ax_apply_{img_bytes_key}",
+                                     type="primary"):
+                            new_axis = dict(axis_config)
+                            new_axis.update({
+                                "x1_val": nx1v, "x2_val": nx2v,
+                                "y1_val": ny1v, "y2_val": ny2v,
+                                "x1_px": float(nx1p), "x2_px": float(nx2p),
+                                # X calibration line runs along the bottom of
+                                # the plot; keep both endpoints at the same y.
+                                "x1_py": float(ny1p), "x2_py": float(ny1p),
+                                # Y calibration runs along the left of the plot;
+                                # keep both endpoints at the same x.
+                                "y1_px": float(nx1p), "y2_px": float(nx1p),
+                                "y1_py": float(ny1p), "y2_py": float(ny2p),
+                                "xIsLogScale": bool(nxlog),
+                                "yIsLogScale": bool(nylog),
+                            })
+                            st.session_state[ax_key] = (new_axis, detections, ocr_results)
+                            st.rerun()
+                    with reset_col:
+                        if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_bytes_key}",
+                                     disabled=chartdete_module is None):
+                            st.session_state.pop(ax_key, None)
+                            st.rerun()
+
                     if ocr_results:
-                        st.markdown("**Detected Labels:**")
+                        st.markdown("**OCR-detected tick labels (reference):**")
                         ocr_text = []
                         if 'xlabels' in ocr_results:
                             x_vals = [f"{l['value']}" for l in ocr_results['xlabels'] if l['value'] is not None]
@@ -995,7 +1093,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                             ocr_text.append(f"Y: [{', '.join(y_vals)}]")
                         st.caption(' | '.join(ocr_text))
         elif auto_axis:
-            axis_placeholder.warning("Could not auto-detect axis calibration. Manual calibration needed in WPD/StarryDigitizer.")
+            axis_placeholder.warning(
+                "Could not auto-detect axis calibration. Enable manual "
+                "calibration below or turn OFF **Auto-detect axis** in the "
+                "sidebar to enter it by hand.")
 
         # ---- ✦ Claude assistance ----
         api_key = (st.session_state.get("vlm_api_key", "")
