@@ -1214,145 +1214,153 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                          if detections is not None
                          else "Axis Calibration (Manual — auto-detection unavailable)")
                 with st.expander(title, expanded=(detections is None)):
-                    # --- Visual axis picker (drag 4 markers on the chart) ---
-                    with st.expander("🎯 Drag calibration markers on the chart",
-                                     expanded=False):
+                    # Streamlit forbids nested expanders, so tabs split the two
+                    # calibration workflows: drag markers on the chart, or type
+                    # the values/pixels in numeric fields.
+                    pick_tab, num_tab = st.tabs([
+                        "🎯 Drag markers on chart",
+                        "🔢 Numeric edit",
+                    ])
+                    with pick_tab:
                         st.caption(
                             "Use this when auto-detection put the markers on "
                             "the wrong ticks. Drag each dot to the tick it "
                             "represents, then press **Save axis positions**. "
                             "This updates the pixel positions in one step so "
-                            "the numeric fields below stay consistent with "
-                            "what's on the chart."
+                            "the numeric fields stay consistent with what's "
+                            "on the chart."
                         )
                         _render_axis_picker(img, axis_config, ax_key,
                                             img_bytes_key, detections, ocr_results)
 
-                    # Prefill from current axis_config values.
-                    st.caption("Change the tick values (data-space) or the "
-                               "pixel positions of the four calibration points. "
-                               "Press **Apply calibration** to redraw and "
-                               "re-export.")
-                    xc1, xc2 = st.columns(2)
-                    with xc1:
-                        st.markdown("**X-axis**")
-                        nx1v = st.number_input(
-                            "X1 value (left tick)",
-                            value=float(axis_config["x1_val"]),
-                            key=f"ax_x1v_{img_bytes_key}", format="%.6g",
-                        )
-                        nx2v = st.number_input(
-                            "X2 value (right tick)",
-                            value=float(axis_config["x2_val"]),
-                            key=f"ax_x2v_{img_bytes_key}", format="%.6g",
-                        )
-                        nx1p = st.number_input(
-                            "X1 pixel (from left)", min_value=0, max_value=W_img,
-                            value=int(round(float(axis_config["x1_px"]))),
-                            key=f"ax_x1p_{img_bytes_key}",
-                        )
-                        nx2p = st.number_input(
-                            "X2 pixel (from left)", min_value=0, max_value=W_img,
-                            value=int(round(float(axis_config["x2_px"]))),
-                            key=f"ax_x2p_{img_bytes_key}",
-                        )
-                        nxlog = st.checkbox(
-                            "X-axis is log scale",
-                            value=bool(axis_config.get("xIsLogScale", False)),
-                            key=f"ax_xlog_{img_bytes_key}",
-                        )
-                    with xc2:
-                        st.markdown("**Y-axis**")
-                        ny1v = st.number_input(
-                            "Y1 value (bottom tick)",
-                            value=float(axis_config["y1_val"]),
-                            key=f"ax_y1v_{img_bytes_key}", format="%.6g",
-                        )
-                        ny2v = st.number_input(
-                            "Y2 value (top tick)",
-                            value=float(axis_config["y2_val"]),
-                            key=f"ax_y2v_{img_bytes_key}", format="%.6g",
-                        )
-                        # y1_py is the bottom (higher pixel), y2_py the top (lower pixel)
-                        ny1p = st.number_input(
-                            "Y1 pixel (from top, larger = lower on chart)",
-                            min_value=0, max_value=H_img,
-                            value=int(round(float(axis_config["y1_py"]))),
-                            key=f"ax_y1p_{img_bytes_key}",
-                        )
-                        ny2p = st.number_input(
-                            "Y2 pixel (from top, smaller = higher on chart)",
-                            min_value=0, max_value=H_img,
-                            value=int(round(float(axis_config["y2_py"]))),
-                            key=f"ax_y2p_{img_bytes_key}",
-                        )
-                        nylog = st.checkbox(
-                            "Y-axis is log scale",
-                            value=bool(axis_config.get("yIsLogScale", False)),
-                            key=f"ax_ylog_{img_bytes_key}",
+                    # The remainder of this expander (numeric form + Apply) is
+                    # rendered inside num_tab so the two views stay side-by-side.
+                    with num_tab:
+                        # Prefill from current axis_config values.
+                        st.caption("Change the tick values (data-space) or the "
+                                   "pixel positions of the four calibration points. "
+                                   "Press **Apply calibration** to redraw and "
+                                   "re-export.")
+                        xc1, xc2 = st.columns(2)
+                        with xc1:
+                            st.markdown("**X-axis**")
+                            nx1v = st.number_input(
+                                "X1 value (left tick)",
+                                value=float(axis_config["x1_val"]),
+                                key=f"ax_x1v_{img_bytes_key}", format="%.6g",
+                            )
+                            nx2v = st.number_input(
+                                "X2 value (right tick)",
+                                value=float(axis_config["x2_val"]),
+                                key=f"ax_x2v_{img_bytes_key}", format="%.6g",
+                            )
+                            nx1p = st.number_input(
+                                "X1 pixel (from left)", min_value=0, max_value=W_img,
+                                value=int(round(float(axis_config["x1_px"]))),
+                                key=f"ax_x1p_{img_bytes_key}",
+                            )
+                            nx2p = st.number_input(
+                                "X2 pixel (from left)", min_value=0, max_value=W_img,
+                                value=int(round(float(axis_config["x2_px"]))),
+                                key=f"ax_x2p_{img_bytes_key}",
+                            )
+                            nxlog = st.checkbox(
+                                "X-axis is log scale",
+                                value=bool(axis_config.get("xIsLogScale", False)),
+                                key=f"ax_xlog_{img_bytes_key}",
+                            )
+                        with xc2:
+                            st.markdown("**Y-axis**")
+                            ny1v = st.number_input(
+                                "Y1 value (bottom tick)",
+                                value=float(axis_config["y1_val"]),
+                                key=f"ax_y1v_{img_bytes_key}", format="%.6g",
+                            )
+                            ny2v = st.number_input(
+                                "Y2 value (top tick)",
+                                value=float(axis_config["y2_val"]),
+                                key=f"ax_y2v_{img_bytes_key}", format="%.6g",
+                            )
+                            # y1_py is the bottom (higher pixel), y2_py the top (lower pixel)
+                            ny1p = st.number_input(
+                                "Y1 pixel (from top, larger = lower on chart)",
+                                min_value=0, max_value=H_img,
+                                value=int(round(float(axis_config["y1_py"]))),
+                                key=f"ax_y1p_{img_bytes_key}",
+                            )
+                            ny2p = st.number_input(
+                                "Y2 pixel (from top, smaller = higher on chart)",
+                                min_value=0, max_value=H_img,
+                                value=int(round(float(axis_config["y2_py"]))),
+                                key=f"ax_y2p_{img_bytes_key}",
+                            )
+                            nylog = st.checkbox(
+                                "Y-axis is log scale",
+                                value=bool(axis_config.get("yIsLogScale", False)),
+                                key=f"ax_ylog_{img_bytes_key}",
+                            )
+
+                        # Live readout so the user can confirm the values that will
+                        # be applied — changing only the value (not the pixel)
+                        # doesn't visually move the marker on the chart, so this
+                        # panel is the primary "did my edit take?" feedback.
+                        st.markdown(
+                            "**Pending calibration (will apply on click):**\n\n"
+                            f"- X: `{nx1v:g}` @ px `{nx1p}` → "
+                            f"`{nx2v:g}` @ px `{nx2p}`\n"
+                            f"- Y: `{ny1v:g}` @ py `{ny1p}` → "
+                            f"`{ny2v:g}` @ py `{ny2p}`\n"
+                            f"- Log scales: X={'on' if nxlog else 'off'}, "
+                            f"Y={'on' if nylog else 'off'}"
                         )
 
-                    # Live readout so the user can confirm the values that will
-                    # be applied — changing only the value (not the pixel)
-                    # doesn't visually move the marker on the chart, so this
-                    # panel is the primary "did my edit take?" feedback.
-                    st.markdown(
-                        "**Pending calibration (will apply on click):**\n\n"
-                        f"- X: `{nx1v:g}` @ px `{nx1p}` → "
-                        f"`{nx2v:g}` @ px `{nx2p}`\n"
-                        f"- Y: `{ny1v:g}` @ py `{ny1p}` → "
-                        f"`{ny2v:g}` @ py `{ny2p}`\n"
-                        f"- Log scales: X={'on' if nxlog else 'off'}, "
-                        f"Y={'on' if nylog else 'off'}"
-                    )
+                        apply_col, reset_col, _ = st.columns([1, 1, 3])
+                        with apply_col:
+                            if st.button("💾 Apply calibration",
+                                         key=f"ax_apply_{img_bytes_key}",
+                                         type="primary"):
+                                new_axis = dict(axis_config)
+                                new_axis.update({
+                                    "x1_val": nx1v, "x2_val": nx2v,
+                                    "y1_val": ny1v, "y2_val": ny2v,
+                                    "x1_px": float(nx1p), "x2_px": float(nx2p),
+                                    # X calibration line runs along the bottom of
+                                    # the plot; keep both endpoints at the same y.
+                                    "x1_py": float(ny1p), "x2_py": float(ny1p),
+                                    # Y calibration runs along the left of the plot;
+                                    # keep both endpoints at the same x.
+                                    "y1_px": float(nx1p), "y2_px": float(nx1p),
+                                    "y1_py": float(ny1p), "y2_py": float(ny2p),
+                                    "xIsLogScale": bool(nxlog),
+                                    "yIsLogScale": bool(nylog),
+                                })
+                                st.session_state[ax_key] = (new_axis, detections, ocr_results)
+                                # Auto-enable value labels on the chart so the user
+                                # can visually confirm that a value-only edit (e.g.
+                                # Y2: 200 → 250 with pixel unchanged) actually
+                                # landed — otherwise the marker sits in the same
+                                # pixel and looks like nothing happened.
+                                st.session_state["_show_values_after_apply"] = True
+                                # Bump rev so the XY table (which converts pixels via
+                                # this calibration) is forced to refresh from source.
+                                st.session_state[rev_key] = rev + 1
+                                st.rerun()
+                        with reset_col:
+                            if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_bytes_key}",
+                                         disabled=chartdete_module is None):
+                                st.session_state.pop(ax_key, None)
+                                st.rerun()
 
-                    apply_col, reset_col, _ = st.columns([1, 1, 3])
-                    with apply_col:
-                        if st.button("💾 Apply calibration",
-                                     key=f"ax_apply_{img_bytes_key}",
-                                     type="primary"):
-                            new_axis = dict(axis_config)
-                            new_axis.update({
-                                "x1_val": nx1v, "x2_val": nx2v,
-                                "y1_val": ny1v, "y2_val": ny2v,
-                                "x1_px": float(nx1p), "x2_px": float(nx2p),
-                                # X calibration line runs along the bottom of
-                                # the plot; keep both endpoints at the same y.
-                                "x1_py": float(ny1p), "x2_py": float(ny1p),
-                                # Y calibration runs along the left of the plot;
-                                # keep both endpoints at the same x.
-                                "y1_px": float(nx1p), "y2_px": float(nx1p),
-                                "y1_py": float(ny1p), "y2_py": float(ny2p),
-                                "xIsLogScale": bool(nxlog),
-                                "yIsLogScale": bool(nylog),
-                            })
-                            st.session_state[ax_key] = (new_axis, detections, ocr_results)
-                            # Auto-enable value labels on the chart so the user
-                            # can visually confirm that a value-only edit (e.g.
-                            # Y2: 200 → 250 with pixel unchanged) actually
-                            # landed — otherwise the marker sits in the same
-                            # pixel and looks like nothing happened.
-                            st.session_state["_show_values_after_apply"] = True
-                            # Bump rev so the XY table (which converts pixels via
-                            # this calibration) is forced to refresh from source.
-                            st.session_state[rev_key] = rev + 1
-                            st.rerun()
-                    with reset_col:
-                        if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_bytes_key}",
-                                     disabled=chartdete_module is None):
-                            st.session_state.pop(ax_key, None)
-                            st.rerun()
-
-                    if ocr_results:
-                        st.markdown("**OCR-detected tick labels (reference):**")
-                        ocr_text = []
-                        if 'xlabels' in ocr_results:
-                            x_vals = [f"{l['value']}" for l in ocr_results['xlabels'] if l['value'] is not None]
-                            ocr_text.append(f"X: [{', '.join(x_vals)}]")
-                        if 'ylabels' in ocr_results:
-                            y_vals = [f"{l['value']}" for l in ocr_results['ylabels'] if l['value'] is not None]
-                            ocr_text.append(f"Y: [{', '.join(y_vals)}]")
-                        st.caption(' | '.join(ocr_text))
+                        if ocr_results:
+                            st.markdown("**OCR-detected tick labels (reference):**")
+                            ocr_text = []
+                            if 'xlabels' in ocr_results:
+                                x_vals = [f"{l['value']}" for l in ocr_results['xlabels'] if l['value'] is not None]
+                                ocr_text.append(f"X: [{', '.join(x_vals)}]")
+                            if 'ylabels' in ocr_results:
+                                y_vals = [f"{l['value']}" for l in ocr_results['ylabels'] if l['value'] is not None]
+                                ocr_text.append(f"Y: [{', '.join(y_vals)}]")
+                            st.caption(' | '.join(ocr_text))
         elif auto_axis:
             axis_placeholder.warning(
                 "Could not auto-detect axis calibration. Enable manual "
