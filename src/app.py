@@ -786,103 +786,180 @@ def _get_input_image(key_prefix="single"):
 
 def _render_visual_editor(img, edited_series, axis_config, selected_idx,
                           ss_key, img_key, palette):
-    """Interactive point editor: chart image as plotly background, click to
-    add/delete points on the selected line. Requires streamlit-plotly-events."""
-    if not PLOTLY_EVENTS_AVAILABLE:
-        st.info("Visual editor requires `plotly` + `streamlit-plotly-events` "
-                "(both installed in this env — reload if you don't see it).")
+    """Interactive point editor built on streamlit-drawable-canvas.
+
+    Fabric.js canvas over the chart image supports clicks on empty space
+    (unlike plotly_events which only fires on data points) AND lets users
+    drag existing points to move them.
+    """
+    try:
+        from streamlit_drawable_canvas import st_canvas
+        from PIL import Image as PILImage
+    except Exception as e:  # noqa: BLE001
+        st.info(f"Visual editor needs streamlit-drawable-canvas: {e}")
         return
 
     H, W = img.shape[:2]
+    pts = edited_series[selected_idx]["points"]
+    # BGR palette -> RGB tuple -> css.
+    r, g, b = palette[selected_idx % len(palette)][::-1]
+    line_css = f"rgb({r},{g},{b})"
 
-    st.markdown("**Visual editor** — click the chart to add/delete points on Line "
-                f"**{selected_idx + 1}**.")
-    mode_col, undo_col = st.columns([3, 1])
+    st.markdown(
+        f"**Visual editor** — Line **{selected_idx + 1}** "
+        f"({len(pts)} pts). Choose a mode and click / drag on the chart."
+    )
+    mode_col, radius_col, undo_col = st.columns([3, 1, 1])
     with mode_col:
         mode = st.radio(
-            "Click mode",
-            ["👁 View only", "➕ Add point", "❌ Delete nearest point"],
+            "Mode",
+            ["👁 View only",
+             "➕ Add point (click empty space)",
+             "🖐 Move points (drag existing)",
+             "❌ Delete nearest (click near a point)"],
             horizontal=True, key=f"vismode_{img_key}_{selected_idx}",
         )
+    with radius_col:
+        r_pt = st.slider("Point radius", 3, 20, 8,
+                         key=f"visr_{img_key}_{selected_idx}")
     with undo_col:
         st.write("")
-        if st.button("↩︎ Undo last visual edit",
+        stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+        if st.button("↩︎ Undo",
                      key=f"vis_undo_{img_key}_{selected_idx}",
-                     disabled=f"vis_undo_stack_{img_key}_{selected_idx}"
-                              not in st.session_state):
-            stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+                     disabled=not st.session_state.get(stack_key)):
             if st.session_state.get(stack_key):
                 prev = st.session_state[stack_key].pop()
                 st.session_state[ss_key][selected_idx]["points"] = prev
                 st.rerun()
 
-    # Encode image as data URL for plotly background.
-    _ok, buf = cv2.imencode(".png", img)
-    if not _ok:
-        st.error("Could not encode image for the plotly editor.")
+    # Fit canvas to viewport width while preserving image aspect.
+    canvas_h = 520
+    canvas_w = int(round(canvas_h * W / H))
+    scale = canvas_h / H  # canvas pixels per image pixel
+
+    def to_canvas(px, py):
+        return px * scale, py * scale
+
+    def to_image(cx, cy):
+        return cx / scale, cy / scale
+
+    # Pre-populate the canvas with the current points as fabric.js circles.
+    initial_objects = []
+    for i, (px, py) in enumerate(pts):
+        cx, cy = to_canvas(px, py)
+        initial_objects.append({
+            "type": "circle",
+            "originX": "center", "originY": "center",
+            "left": cx, "top": cy,
+            "radius": r_pt,
+            "fill": line_css,
+            "stroke": "#000000",
+            "strokeWidth": 1,
+            "selectable": mode.startswith("🖐"),
+            "hasControls": False,     # no resize handles
+            "hasBorders": mode.startswith("🖐"),
+            "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
+        })
+
+    if mode.startswith("➕") or mode.startswith("❌"):
+        drawing_mode = "point"
+    elif mode.startswith("🖐"):
+        drawing_mode = "transform"
+    else:
+        drawing_mode = "transform"  # view: transform mode w/ selectable=False → no-op
+
+    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    # Include mode + point count in the key so canvas resets when mode changes
+    # (otherwise fabric.js keeps stale objects when we swap initial_drawing).
+    canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode[:2]}_{len(pts)}"
+    result = st_canvas(
+        fill_color=line_css,
+        stroke_color=line_css,
+        stroke_width=1,
+        background_image=pil_bg,
+        update_streamlit=True,
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode=drawing_mode,
+        initial_drawing={"version": "4.4.0", "objects": initial_objects},
+        display_toolbar=False,
+        point_display_radius=r_pt,
+        key=canvas_key,
+    )
+
+    if not result or not result.json_data:
         return
-    img_b64 = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode()
+    objects = result.json_data.get("objects", []) or []
 
-    pts = edited_series[selected_idx]["points"]
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    line_color = "rgb({},{},{})".format(*palette[selected_idx % len(palette)][::-1])
+    # Extract circle centres in image coords.
+    canvas_pts = []
+    for obj in objects:
+        t = obj.get("type")
+        left = float(obj.get("left", 0))
+        top = float(obj.get("top", 0))
+        radius = float(obj.get("radius", r_pt))
+        origin_x = obj.get("originX", "left")
+        origin_y = obj.get("originY", "top")
+        # Fabric "point" produces a circle with originX/Y = "center".
+        if origin_x != "center":
+            cx = left + radius
+        else:
+            cx = left
+        if origin_y != "center":
+            cy = top + radius
+        else:
+            cy = top
+        if t in ("circle",):
+            px, py = to_image(cx, cy)
+            canvas_pts.append([px, py])
 
-    fig = go.Figure()
-    fig.add_layout_image(
-        source=img_b64, xref="x", yref="y",
-        x=0, y=0, sizex=W, sizey=H,
-        sizing="stretch", opacity=1.0, layer="below",
-    )
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="markers+lines",
-        marker=dict(size=10, color=line_color,
-                    line=dict(color="black", width=1)),
-        line=dict(color=line_color, width=1.5),
-        hovertemplate="pixel (%{x:.0f}, %{y:.0f})<extra></extra>",
-        name=f"Line {selected_idx+1}",
-    ))
-    fig.update_xaxes(range=[0, W], visible=False, constrain="domain")
-    fig.update_yaxes(range=[H, 0], visible=False, scaleanchor="x", scaleratio=1)
-    # Compact layout — height matches other charts (55vh ≈ 500px).
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=520,
-        showlegend=False,
-        dragmode=False,
-    )
-
-    click_event = mode != "👁 View only"
-    events = plotly_events(
-        fig,
-        click_event=click_event,
-        override_height=520,
-        key=f"vis_editor_{img_key}_{selected_idx}",
-    )
-
-    if events and click_event:
-        cx = float(events[0]["x"])
-        cy = float(events[0]["y"])
-        stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+    def push_undo():
         st.session_state.setdefault(stack_key, [])
         st.session_state[stack_key].append(copy.deepcopy(pts))
         if len(st.session_state[stack_key]) > 20:
             st.session_state[stack_key] = st.session_state[stack_key][-20:]
 
-        if mode.startswith("➕"):
-            # Insert in x-sorted position so lines stay ordered.
-            new_pts = list(pts) + [[int(round(cx)), int(round(cy))]]
-            new_pts.sort(key=lambda p: p[0])
-            st.session_state[ss_key][selected_idx]["points"] = new_pts
-            st.rerun()
-        elif mode.startswith("❌") and pts:
-            # Find nearest point in pixel space and remove it.
-            arr = np.array(pts, dtype=float)
-            d2 = (arr[:, 0] - cx) ** 2 + (arr[:, 1] - cy) ** 2
-            i = int(np.argmin(d2))
-            new_pts = [p for j, p in enumerate(pts) if j != i]
-            st.session_state[ss_key][selected_idx]["points"] = new_pts
-            st.rerun()
+    changed = False
+    new_pts = None
+
+    if mode.startswith("➕"):
+        # Every extra circle beyond the initial set is a newly-added point.
+        if len(canvas_pts) > len(pts):
+            new_ones = canvas_pts[len(pts):]
+            merged = list(pts) + [[int(round(p[0])), int(round(p[1]))]
+                                  for p in new_ones]
+            merged.sort(key=lambda p: p[0])
+            new_pts = merged
+            changed = True
+    elif mode.startswith("❌"):
+        # New circles are "delete cursors": for each new click, drop the
+        # nearest existing point.
+        if len(canvas_pts) > len(pts) and pts:
+            new_ones = canvas_pts[len(pts):]
+            surviving = [list(p) for p in pts]
+            for click in new_ones:
+                if not surviving:
+                    break
+                arr = np.array(surviving, dtype=float)
+                d2 = (arr[:, 0] - click[0]) ** 2 + (arr[:, 1] - click[1]) ** 2
+                idx = int(np.argmin(d2))
+                del surviving[idx]
+            new_pts = [[int(round(p[0])), int(round(p[1]))] for p in surviving]
+            changed = True
+    elif mode.startswith("🖐"):
+        # Same object count but positions may have moved via drag.
+        if len(canvas_pts) == len(pts):
+            moved = [[int(round(p[0])), int(round(p[1]))] for p in canvas_pts]
+            moved.sort(key=lambda p: p[0])
+            if moved != [list(x) for x in pts]:
+                new_pts = moved
+                changed = True
+
+    if changed and new_pts is not None:
+        push_undo()
+        st.session_state[ss_key][selected_idx]["points"] = new_pts
+        st.rerun()
 
 
 def _render_single_image_pipeline(img, name, infer_module, chartdete_module, config):
