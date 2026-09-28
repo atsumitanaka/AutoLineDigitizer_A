@@ -1618,7 +1618,7 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                     px, py = x, y
                 new_pts.append([int(round(px)), int(round(py))])
 
-            btn_col1, btn_col2, _ = st.columns([1, 1, 3])
+            btn_col1, btn_col2, btn_col3, _ = st.columns([1, 1, 1, 2])
             with btn_col1:
                 if st.button("💾 Apply edits", key=f"apply_{img_bytes_key}_{idx}",
                              type="primary"):
@@ -1626,10 +1626,42 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                     st.rerun()
             with btn_col2:
                 if st.button("↩︎ Reset this line",
-                             key=f"reset_{img_bytes_key}_{idx}"):
+                             key=f"reset_{img_bytes_key}_{idx}",
+                             help="Restore this line's auto-detected points."):
                     st.session_state[ss_key][idx]["points"] = copy.deepcopy(
                         data_series[idx]["points"])
                     st.rerun()
+            with btn_col3:
+                # Two-step confirm so an accidental click doesn't wipe a whole
+                # line. Session flag remembers the arm state per line/image.
+                arm_key = f"delline_arm_{img_bytes_key}_{idx}"
+                if st.session_state.get(arm_key):
+                    if st.button(f"⚠️ Confirm delete Line {idx+1}",
+                                 key=f"del_confirm_{img_bytes_key}_{idx}",
+                                 type="secondary",
+                                 help="This drops the entire line from the "
+                                      "session — Reset all lines can bring "
+                                      "it back."):
+                        # Drop the line entirely.
+                        del st.session_state[ss_key][idx]
+                        st.session_state.pop(arm_key, None)
+                        # Force the Curves selectbox off this now-missing
+                        # index so we don't crash on the next render.
+                        sel_key = f"curve_sel_{img_bytes_key}"
+                        st.session_state[sel_key] = "all"
+                        st.session_state[rev_key] = rev + 1
+                        st.rerun()
+                    if st.button("Cancel",
+                                 key=f"del_cancel_{img_bytes_key}_{idx}"):
+                        st.session_state.pop(arm_key, None)
+                        st.rerun()
+                else:
+                    if st.button(f"🗑 Delete entire Line {idx+1}",
+                                 key=f"del_line_{img_bytes_key}_{idx}",
+                                 help="Remove this line from the extraction. "
+                                      "You'll be asked to confirm."):
+                        st.session_state[arm_key] = True
+                        st.rerun()
 
             if len(new_pts) != len(pts_px):
                 st.info(f"Pending: {len(new_pts)} points "
@@ -1641,6 +1673,10 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                 if st.button("↩︎ Reset all lines to auto-detected",
                              key=f"reset_all_{img_bytes_key}"):
                     st.session_state[ss_key] = copy.deepcopy(data_series)
+                    # Reset any partially-armed delete buttons.
+                    for k in list(st.session_state):
+                        if k.startswith(f"delline_arm_{img_bytes_key}"):
+                            st.session_state.pop(k, None)
                     st.rerun()
 
         # Downloads/exports use the *edited* series so user changes reach WPD/SD.
