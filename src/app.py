@@ -1045,24 +1045,32 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
     # that fabric.js chokes on silently (renders a blank canvas with no
     # background). Reopening the RGB view is cheap and forces a known mode.
     pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "RGB")
+
+    # Show the plain image right above the canvas as a fallback / sanity check
+    # — this ALWAYS renders, so users can at least see the chart even if the
+    # canvas iframe fails to mount on their browser.
+    with st.container():
+        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                 caption=f"Chart preview ({W}×{H})",
+                 width=min(canvas_w, 700))
+
     canvas_key = f"axis_pick_{img_key}"
-    result = st_canvas(
-        fill_color="#e74c3c",
-        stroke_color="#000000",
-        stroke_width=2,
-        background_image=pil_bg,
-        # Was False here to avoid mid-drag reruns, but that combined with
-        # transform mode + an initial_drawing seems to prevent the canvas
-        # iframe from mounting the background on Streamlit 1.40 + drawable-
-        # canvas 0.9.3. update_streamlit=True is what the point editor uses,
-        # and it renders reliably — Save button below still commits atomically.
-        update_streamlit=True,
-        height=canvas_h, width=canvas_w,
-        drawing_mode="transform",
-        initial_drawing={"version": "4.4.0", "objects": initial_objects},
-        display_toolbar=False,
-        key=canvas_key,
-    )
+    try:
+        result = st_canvas(
+            fill_color="#e74c3c",
+            stroke_color="#000000",
+            stroke_width=2,
+            background_image=pil_bg,
+            update_streamlit=True,
+            height=canvas_h, width=canvas_w,
+            drawing_mode="transform",
+            initial_drawing={"version": "4.4.0", "objects": initial_objects},
+            display_toolbar=False,
+            key=canvas_key,
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Canvas failed to render: {e}")
+        result = None
 
     st.caption(
         "Red = X-axis calibration points (drag to the left tick then the "
@@ -1262,18 +1270,18 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                 title = ("Axis Calibration (Auto-detected — click to edit)"
                          if detections is not None
                          else "Axis Calibration (Manual — auto-detection unavailable)")
-                # Drag picker at TOP level — st_canvas can't reliably mount
-                # its iframe when nested under expander -> tabs, so we keep it
-                # a sibling of the Axis Calibration expander instead.
-                with st.expander("🎯 Drag calibration markers on chart",
-                                 expanded=False):
-                    st.caption(
-                        "Drag each dot to the tick it represents, enter the "
-                        "corresponding data value, then press **Save**. "
-                        "Red = X axis, Blue = Y axis."
-                    )
-                    _render_axis_picker(img, axis_config, ax_key,
-                                        img_bytes_key, detections, ocr_results)
+                # Drag picker rendered outside any expander/tab. Nested layout
+                # (expander -> canvas, expander -> tab -> canvas) was leaving
+                # the fabric.js iframe with size 0 or unmounted, so the
+                # background never showed. Rendering at top level fixes that.
+                st.markdown("### 🎯 Drag calibration markers on chart")
+                st.caption(
+                    "Drag each dot to the tick it represents, enter the "
+                    "corresponding data value, then press **Save**. "
+                    "Red = X axis, Blue = Y axis."
+                )
+                _render_axis_picker(img, axis_config, ax_key,
+                                    img_bytes_key, detections, ocr_results)
 
                 with st.expander(title, expanded=(detections is None)):
                     st.info(
