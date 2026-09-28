@@ -983,6 +983,11 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     if changed and new_pts is not None:
         push_undo()
         st.session_state[ss_key][selected_idx]["points"] = new_pts
+        # Force the paired XY table (st.data_editor) to re-read from source by
+        # bumping the shared revision counter — otherwise its cached user edits
+        # override the fresh points we just wrote.
+        rev_key = f"rev_{img_key}"
+        st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
         st.rerun()
 
 
@@ -1038,19 +1043,22 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         img_bytes_key = hashlib.md5(img.tobytes()).hexdigest()[:12]
         ss_key = f"series_{img_bytes_key}"
         ax_key = f"axis_{img_bytes_key}"
+        # A monotonically increasing revision the visual editor / axis editor
+        # bump whenever they write to session_state — so widgets whose data is
+        # driven from outside (data_editor especially, which caches per-key
+        # user edits) can be forced to re-instantiate with fresh data.
+        rev_key = f"rev_{img_bytes_key}"
         if ss_key not in st.session_state:
             st.session_state[ss_key] = copy.deepcopy(data_series)
+        if rev_key not in st.session_state:
+            st.session_state[rev_key] = 0
         edited_series = st.session_state[ss_key]
+        rev = st.session_state[rev_key]
 
-        # Show initial result (without axis calibration) immediately
-        if show_visualization:
-            result_img = draw_points_on_image(
-                img, edited_series, None,
-                show_calibration=config.get("show_calibration", True),
-                show_calibration_values=config.get("show_calibration_values", False),
-                show_line_numbers=True,
-            )
-            viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+        # NOTE: no initial viz render here — we wait until after axis detection
+        # so viz_placeholder is written exactly once per rerun, with the final
+        # axis_config baked in. The double-render was overwriting Applied
+        # calibration edits back to the auto-detected (or None) state.
 
         # Show line summary
         total_points = sum(len(s['points']) for s in edited_series)
@@ -1176,6 +1184,9 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                                 "yIsLogScale": bool(nylog),
                             })
                             st.session_state[ax_key] = (new_axis, detections, ocr_results)
+                            # Bump rev so the XY table (which converts pixels via
+                            # this calibration) is forced to refresh from source.
+                            st.session_state[rev_key] = rev + 1
                             st.rerun()
                     with reset_col:
                         if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_bytes_key}",
@@ -1309,9 +1320,12 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             st.caption(f"Line {idx+1} — {len(rows)} points{cal_note}. "
                        "Edit any cell, add rows at the bottom, or use the row "
                        "checkbox + Delete key to remove points.")
+            # rev is bumped by the visual editor / axis calibration Apply so
+            # the data_editor's cached user-edit deltas can't shadow fresh
+            # points that came from a canvas drag or a recalibrated axis.
             edited_df = st.data_editor(
                 df, num_rows="dynamic", use_container_width=True,
-                key=f"editor_{img_bytes_key}_{idx}",
+                key=f"editor_{img_bytes_key}_{idx}_r{rev}",
                 column_config={c: st.column_config.NumberColumn(c, format="%.6g")
                                for c in cols},
             )
