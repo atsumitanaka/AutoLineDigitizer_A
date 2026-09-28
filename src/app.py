@@ -1059,13 +1059,40 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
     st.caption(
         "Red = X-axis calibration points (drag to the left tick then the "
         "right tick). Blue = Y-axis calibration points (drag to the bottom "
-        "tick then the top tick)."
+        "tick then the top tick). "
+        "Enter the DATA VALUE each dragged marker represents, then Save."
     )
+
+    # Value inputs for the 4 markers — pre-filled with current calibration.
+    st.markdown("**Data values at each dragged marker:**")
+    vc1, vc2 = st.columns(2)
+    with vc1:
+        v_x1 = st.number_input(
+            "🔴 X1 value (left tick on X axis)",
+            value=float(axis_config["x1_val"]),
+            key=f"axpick_x1v_{img_key}", format="%.6g",
+        )
+        v_x2 = st.number_input(
+            "🔴 X2 value (right tick on X axis)",
+            value=float(axis_config["x2_val"]),
+            key=f"axpick_x2v_{img_key}", format="%.6g",
+        )
+    with vc2:
+        v_y1 = st.number_input(
+            "🔵 Y1 value (bottom tick on Y axis)",
+            value=float(axis_config["y1_val"]),
+            key=f"axpick_y1v_{img_key}", format="%.6g",
+        )
+        v_y2 = st.number_input(
+            "🔵 Y2 value (top tick on Y axis)",
+            value=float(axis_config["y2_val"]),
+            key=f"axpick_y2v_{img_key}", format="%.6g",
+        )
 
     save_col, _ = st.columns([1, 4])
     with save_col:
-        if st.button("💾 Save axis positions", key=f"axpick_save_{img_key}",
-                     type="primary"):
+        if st.button("💾 Save positions + values",
+                     key=f"axpick_save_{img_key}", type="primary"):
             if result and result.json_data:
                 objs = result.json_data.get("objects", []) or []
                 # Extract centres in image coords.
@@ -1096,6 +1123,10 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
                         # endpoints share the x of X1 (bottom-left).
                         "y1_px": x1_px, "y2_px": x1_px,
                         "y1_py": y1_py, "y2_py": y2_py,
+                        # Values from the four typed fields — no more
+                        # "dragged to 250 but still labeled 200" mismatch.
+                        "x1_val": v_x1, "x2_val": v_x2,
+                        "y1_val": v_y1, "y2_val": v_y2,
                     })
                     st.session_state[ax_key] = (new_axis, detections, ocr_results)
                     st.session_state["_show_values_after_apply"] = True
