@@ -991,6 +991,121 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         st.rerun()
 
 
+def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_results):
+    """Visual calibration picker: drag the four X1/X2/Y1/Y2 markers on the
+    input image to their true tick positions, then click Save.
+
+    Keeps X1/X2 y-values coupled (both live on the X-axis line at the bottom of
+    the plot) and Y1/Y2 x-values coupled (both live on the Y-axis line at the
+    left), matching how detect_axis_calibration builds the config.
+    """
+    try:
+        from streamlit_drawable_canvas import st_canvas
+        from PIL import Image as PILImage
+    except Exception as e:  # noqa: BLE001
+        st.info(f"Visual axis picker needs streamlit-drawable-canvas: {e}")
+        return
+
+    H, W = img.shape[:2]
+    canvas_h = 460
+    canvas_w = int(round(canvas_h * W / H))
+    scale = canvas_h / H
+
+    def to_canvas(px, py):
+        return px * scale, py * scale
+
+    def to_image(cx, cy):
+        return cx / scale, cy / scale
+
+    # Order in initial_objects is preserved by fabric.js — we rely on that to
+    # map indices back to X1, X2, Y1, Y2.
+    calib_points = [
+        ("X1", axis_config["x1_px"], axis_config["x1_py"], "#e74c3c"),
+        ("X2", axis_config["x2_px"], axis_config["x2_py"], "#e74c3c"),
+        ("Y1", axis_config["y1_px"], axis_config["y1_py"], "#3498db"),
+        ("Y2", axis_config["y2_px"], axis_config["y2_py"], "#3498db"),
+    ]
+    initial_objects = []
+    for label, px, py, color in calib_points:
+        cx, cy = to_canvas(float(px), float(py))
+        initial_objects.append({
+            "type": "circle",
+            "originX": "center", "originY": "center",
+            "left": cx, "top": cy,
+            "radius": 12,
+            "fill": color,
+            "stroke": "#000000", "strokeWidth": 2,
+            "selectable": True,
+            "hasControls": False,
+            "hasBorders": True,
+            "lockRotation": True, "lockScalingX": True, "lockScalingY": True,
+        })
+
+    pil_bg = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    canvas_key = f"axis_pick_{img_key}"
+    result = st_canvas(
+        fill_color="#e74c3c",
+        stroke_color="#000000",
+        stroke_width=2,
+        background_image=pil_bg,
+        update_streamlit=False,          # avoid mid-drag reruns
+        height=canvas_h, width=canvas_w,
+        drawing_mode="transform",
+        initial_drawing={"version": "4.4.0", "objects": initial_objects},
+        display_toolbar=False,
+        key=canvas_key,
+    )
+
+    st.caption(
+        "Red = X-axis calibration points (drag to the left tick then the "
+        "right tick). Blue = Y-axis calibration points (drag to the bottom "
+        "tick then the top tick)."
+    )
+
+    save_col, _ = st.columns([1, 4])
+    with save_col:
+        if st.button("💾 Save axis positions", key=f"axpick_save_{img_key}",
+                     type="primary"):
+            if result and result.json_data:
+                objs = result.json_data.get("objects", []) or []
+                # Extract centres in image coords.
+                new_px = []
+                for obj in objs:
+                    left = float(obj.get("left", 0))
+                    top = float(obj.get("top", 0))
+                    ox = obj.get("originX", "left")
+                    oy = obj.get("originY", "top")
+                    radius = float(obj.get("radius", 0))
+                    cx = left if ox == "center" else (left + radius)
+                    cy = top if oy == "center" else (top + radius)
+                    ix, iy = to_image(cx, cy)
+                    new_px.append((ix, iy))
+                if len(new_px) >= 4:
+                    x1_px, x1_py = new_px[0]
+                    x2_px, x2_py = new_px[1]
+                    y1_px, y1_py = new_px[2]
+                    y2_px, y2_py = new_px[3]
+                    new_axis = dict(axis_config)
+                    new_axis.update({
+                        # X calibration line runs along the bottom — its
+                        # y-values should share the y position of Y1
+                        # (the bottom-left corner).
+                        "x1_px": x1_px, "x2_px": x2_px,
+                        "x1_py": y1_py, "x2_py": y1_py,
+                        # Y calibration line runs along the left — both
+                        # endpoints share the x of X1 (bottom-left).
+                        "y1_px": x1_px, "y2_px": x1_px,
+                        "y1_py": y1_py, "y2_py": y2_py,
+                    })
+                    st.session_state[ax_key] = (new_axis, detections, ocr_results)
+                    st.session_state["_show_values_after_apply"] = True
+                    # Bump rev so downstream widgets refresh.
+                    for k in list(st.session_state):
+                        if k.startswith(f"rev_{img_key}"):
+                            st.session_state[k] += 1
+                    st.rerun()
+
+
 def _render_single_image_pipeline(img, name, infer_module, chartdete_module, config):
     """Existing single-image workflow, refactored to accept a preloaded image."""
     show_visualization = config["show_visualization"]
@@ -1099,6 +1214,20 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                          if detections is not None
                          else "Axis Calibration (Manual — auto-detection unavailable)")
                 with st.expander(title, expanded=(detections is None)):
+                    # --- Visual axis picker (drag 4 markers on the chart) ---
+                    with st.expander("🎯 Drag calibration markers on the chart",
+                                     expanded=False):
+                        st.caption(
+                            "Use this when auto-detection put the markers on "
+                            "the wrong ticks. Drag each dot to the tick it "
+                            "represents, then press **Save axis positions**. "
+                            "This updates the pixel positions in one step so "
+                            "the numeric fields below stay consistent with "
+                            "what's on the chart."
+                        )
+                        _render_axis_picker(img, axis_config, ax_key,
+                                            img_bytes_key, detections, ocr_results)
+
                     # Prefill from current axis_config values.
                     st.caption("Change the tick values (data-space) or the "
                                "pixel positions of the four calibration points. "
