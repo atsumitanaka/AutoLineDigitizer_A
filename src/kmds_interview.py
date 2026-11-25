@@ -516,7 +516,7 @@ async def extract_kmds_interview(pdf_path: str, output_dir: str,
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
     if schema_path is None:
         schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "kmds_v15.2.4_nullable.json")
+                                   "ncmrd_schema_tanaka.json")
     with open(schema_path, "r", encoding="utf-8") as f:
         schema = json.load(f)
 

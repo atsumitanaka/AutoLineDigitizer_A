@@ -65,12 +65,11 @@ a = Analysis(
         ('tools/starrydata_upload.py', 'tools'),
         # Paper-record HTML viewer template
         ('kmds_paper_viewer_claude.html', '.'),
-        # EasyOCR models (bundled for offline use)
-        (os.path.join(spec_dir, 'easyocr_models'), 'easyocr_models'),
-        # MinerU PP-DocLayoutV2 weights (default PDF figure detector).
-        # CI downloads these before building (see release.yml); a missing dir
-        # fails the build loudly rather than shipping without the detector.
-        (os.path.join(spec_dir, 'pp_doclayoutv2_weights'), 'pp_doclayoutv2_weights'),
+        # NOTE: easyocr_models and pp_doclayoutv2_weights are NOT bundled anymore
+        # (they used to live in `datas` and inflated the .app by ~300 MB each).
+        # EasyOCR auto-downloads to ~/.EasyOCR/model on first use; PP-DocLayoutV2
+        # is fetched by src/mineru_layout on first MinerU call. Both land in the
+        # user data directory so they survive app upgrades.
     ],
     hiddenimports=[
         'mmdet',

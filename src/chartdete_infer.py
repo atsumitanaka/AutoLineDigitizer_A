@@ -203,19 +203,51 @@ def detect_chart_elements(img, score_thr=0.5, model=None):
     return detections
 
 
+def _easyocr_user_dir():
+    """Shared per-user cache for EasyOCR weights.
+
+    Co-located with the app's other model downloads so they survive .app
+    upgrades and a user cleaning ~/.EasyOCR for an unrelated project.
+    """
+    if sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library",
+                            "Application Support", "AutoLineDigitizer")
+    elif sys.platform == "win32":
+        base = os.path.join(os.environ.get("LOCALAPPDATA",
+                                            os.path.expanduser("~")),
+                            "AutoLineDigitizer")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".autolinedigitizer")
+    model_dir = os.path.join(base, "models", "easyocr")
+    os.makedirs(model_dir, exist_ok=True)
+    return model_dir
+
+
 def get_ocr_reader():
-    """Get or initialize EasyOCR reader."""
+    """Get or initialize EasyOCR reader.
+
+    Weights live in the user data dir (auto-downloaded on first run). Pre-v0.9
+    bundles shipped them under _MEIPASS/easyocr_models; still honored if present.
+    """
     global _ocr_reader
     if _ocr_reader is None:
         import easyocr
-        # Use bundled models for PyInstaller builds
-        model_dir = None
-        if getattr(sys, 'frozen', False):
-            model_dir = os.path.join(sys._MEIPASS, 'easyocr_models')
-        if model_dir and os.path.isdir(model_dir):
-            _ocr_reader = easyocr.Reader(['en'], gpu=False, model_storage_directory=model_dir, download_enabled=False)
+        # Legacy bundled layout (pre-v0.9 .app): use the baked-in weights offline.
+        bundled = None
+        if getattr(sys, "frozen", False):
+            cand = os.path.join(sys._MEIPASS, "easyocr_models")
+            if os.path.isdir(cand):
+                bundled = cand
+        if bundled:
+            _ocr_reader = easyocr.Reader(
+                ["en"], gpu=False,
+                model_storage_directory=bundled, download_enabled=False)
         else:
-            _ocr_reader = easyocr.Reader(['en'], gpu=False)
+            # Default path: user data dir with network download allowed.
+            _ocr_reader = easyocr.Reader(
+                ["en"], gpu=False,
+                model_storage_directory=_easyocr_user_dir(),
+                download_enabled=True)
     return _ocr_reader
 
 

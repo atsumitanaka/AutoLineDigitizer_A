@@ -9,7 +9,7 @@ Open a new chat in any LLM interface that supports file attachments
 1. This prompt text (or paste the body below into the message)
 2. The KMDS schema JSON (latest public version, nullable variant 
    recommended)
-   Current version: kmds_v15.2.4_nullable.json
+   Current version: ncmrd_schema_tanaka.json
 3. The paper PDF to be extracted
 ```
 

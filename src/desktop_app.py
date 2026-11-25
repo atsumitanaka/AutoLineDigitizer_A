@@ -64,65 +64,92 @@ from app_settings import load_saved_api_key, save_api_key
 # VLM/KMDS components check for one.
 load_saved_api_key()
 
-try:
-    from vlm_verifier import VLMVerifier, ANTHROPIC_AVAILABLE
-    VLM_VERIFIER_AVAILABLE = True
-except Exception as _vlm_err:
-    VLM_VERIFIER_AVAILABLE = False
-    ANTHROPIC_AVAILABLE = False
+# Heavy submodules are probed (cheap) now and imported for real at first use.
+# Loading anthropic/transformers/mmdet at startup burned ~500 MB RSS and added
+# several seconds before the UI was interactive — defer them to first-click.
+import importlib.util as _ilu
 
+
+def _mod_present(name):
+    try:
+        return _ilu.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# Cheap existence probes. The real import happens inside the handlers.
+ANTHROPIC_AVAILABLE = _mod_present("anthropic")
+VLM_VERIFIER_AVAILABLE = _mod_present("vlm_verifier")
+VLM_SCREENER_AVAILABLE = _mod_present("vlm_screener")
+VLM_SCREENER_SDK_AVAILABLE = ANTHROPIC_AVAILABLE
+MARKER_DETECTOR_AVAILABLE = _mod_present("line_marker_detector")
+PDF_SUPPORT = _mod_present("pdf_figures") and _mod_present("fitz")
+# DOCLAYOUT_OK / MINERU_OK are truly checked by the pdf_figures helpers at use
+# time (they need to probe weights too). Keep optimistic defaults here so the
+# UI doesn't disable the detector dropdown before pdf_figures has loaded.
+DOCLAYOUT_OK = PDF_SUPPORT
+MINERU_OK = PDF_SUPPORT
+KMDS_AVAILABLE = ANTHROPIC_AVAILABLE and _mod_present("kmds_parallel")
+
+# kmds_vocab is tiny (JSON schema walk) and consulted everywhere the preview
+# label is drawn — keep it eager.
 try:
     import kmds_vocab
     KMDS_VOCAB_AVAILABLE = kmds_vocab.available()
-except Exception:  # noqa: BLE001
+except Exception:
     KMDS_VOCAB_AVAILABLE = False
-    print(f"VLM verifier not available: {_vlm_err}")
 
-try:
-    from line_marker_detector import find_markers_on_traced_line
-    MARKER_DETECTOR_AVAILABLE = True
-except Exception as _md_err:
-    MARKER_DETECTOR_AVAILABLE = False
-    print(f"line_marker_detector not available: {_md_err}")
+# Deferred import helpers. Each caches a tuple of the module's public names used
+# by this file, so the first call pays the import cost and every later call is
+# just a dict lookup.
+_LAZY_CACHE = {}
 
-# PDF figure extraction (shared with batch_extract via pdf_figures.py).
-try:
-    from pdf_figures import (
-        extract_figures,
-        extract_figures_via_page_render,
-        extract_figures_via_doclayout,
-        extract_figures_via_mineru,
-        doclayout_available,
-        mineru_available,
-        render_pdf_page,
-    )
-    PDF_SUPPORT = True
-    DOCLAYOUT_OK = doclayout_available()
-    MINERU_OK = mineru_available()
-except Exception as _pdf_err:
-    PDF_SUPPORT = False
-    DOCLAYOUT_OK = False
-    MINERU_OK = False
-    print(f"PDF support not available: {_pdf_err}")
 
-# VLM screener for the page-render fallback (vector-only figures).
-try:
-    from vlm_screener import VLMScreener, ANTHROPIC_AVAILABLE as VLM_SCREENER_SDK_AVAILABLE
-    VLM_SCREENER_AVAILABLE = True
-except Exception as _scr_err:
-    VLMScreener = None
-    VLM_SCREENER_SDK_AVAILABLE = False
-    VLM_SCREENER_AVAILABLE = False
-    print(f"VLM screener not available: {_scr_err}")
+def _lazy_pdf_figures():
+    """Return the pdf_figures module (loaded on first call)."""
+    mod = _LAZY_CACHE.get("pdf_figures")
+    if mod is None:
+        import pdf_figures as _pdf
+        _LAZY_CACHE["pdf_figures"] = _pdf
+        mod = _pdf
+    return mod
 
-# KMDS structured-metadata extraction (parallel Claude calls on the whole PDF).
-try:
-    import kmds_parallel
-    KMDS_AVAILABLE = kmds_parallel.ANTHROPIC_AVAILABLE
-except Exception as _kmds_err:
-    kmds_parallel = None
-    KMDS_AVAILABLE = False
-    print(f"KMDS extraction not available: {_kmds_err}")
+
+def _lazy_kmds_parallel():
+    """Return the kmds_parallel module (loaded on first call)."""
+    mod = _LAZY_CACHE.get("kmds_parallel")
+    if mod is None:
+        import kmds_parallel as _kp
+        _LAZY_CACHE["kmds_parallel"] = _kp
+        mod = _kp
+    return mod
+
+
+def _lazy_VLMVerifier():
+    cls = _LAZY_CACHE.get("VLMVerifier")
+    if cls is None:
+        from vlm_verifier import VLMVerifier as _V
+        _LAZY_CACHE["VLMVerifier"] = _V
+        cls = _V
+    return cls
+
+
+def _lazy_VLMScreener():
+    cls = _LAZY_CACHE.get("VLMScreener")
+    if cls is None:
+        from vlm_screener import VLMScreener as _V
+        _LAZY_CACHE["VLMScreener"] = _V
+        cls = _V
+    return cls
+
+
+def _lazy_find_markers():
+    fn = _LAZY_CACHE.get("find_markers_on_traced_line")
+    if fn is None:
+        from line_marker_detector import find_markers_on_traced_line as _f
+        _LAZY_CACHE["find_markers_on_traced_line"] = _f
+        fn = _f
+    return fn
 
 GITHUB_REPO = "adityaaa-IIT-BHU/AutoLineDigitizer"
 GITHUB_RELEASE_TAG = "models"
@@ -321,6 +348,7 @@ class LineFormerApp:
             raise RuntimeError("PDF support unavailable (PyMuPDF not installed).")
 
         figs = []
+        _pdf = _lazy_pdf_figures()
         use_mineru = (detector == "mineru") and MINERU_OK
         use_vlm = (detector == "vlm") and prefer_vlm and self._vlm_screener_available()
         use_doclayout = (detector == "doclayout") and DOCLAYOUT_OK
@@ -330,7 +358,7 @@ class LineFormerApp:
             try:
                 if progress:
                     progress(0, "mineru-start")
-                for img_bgr, meta in extract_figures_via_mineru(
+                for img_bgr, meta in _pdf.extract_figures_via_mineru(
                     pdf_path, dpi=page_dpi, min_size=200
                 ):
                     meta = dict(meta)
@@ -346,7 +374,7 @@ class LineFormerApp:
             try:
                 if progress:
                     progress(0, "doclayout-start")
-                for img_bgr, meta in extract_figures_via_doclayout(
+                for img_bgr, meta in _pdf.extract_figures_via_doclayout(
                     pdf_path, dpi=page_dpi, min_size=200
                 ):
                     meta = dict(meta)
@@ -362,8 +390,8 @@ class LineFormerApp:
             try:
                 if progress:
                     progress(0, "vlm-start")
-                screener = VLMScreener(model=vlm_model)
-                for img_bgr, meta in extract_figures_via_page_render(
+                screener = _lazy_VLMScreener()(model=vlm_model)
+                for img_bgr, meta in _pdf.extract_figures_via_page_render(
                     pdf_path, screener, dpi=page_dpi, min_size=200,
                     refine=refine, refine_model=refine_model,
                 ):
@@ -380,7 +408,7 @@ class LineFormerApp:
             if use_vlm:
                 print("[pdf] VLM found no charts; falling back to raster bitmaps.")
             try:
-                for img_bgr, meta in extract_figures(pdf_path, min_size=200):
+                for img_bgr, meta in _pdf.extract_figures(pdf_path, min_size=200):
                     meta = dict(meta)
                     meta["source"] = "raster"
                     figs.append((img_bgr, meta))
@@ -424,8 +452,15 @@ class LineFormerApp:
         self.chartdete_module = chartdete_infer
 
     def detect_axis_calibration(self, img):
+        # Lazy-load ChartDete on first axis-detection call so startup stays
+        # cheap. Failure here is non-fatal — the UI falls back to manual axis
+        # calibration (same behavior as before when ChartDete wasn't bundled).
         if self.chartdete_module is None:
-            return None, None
+            try:
+                self.load_chartdete_model()
+            except Exception as e:
+                print(f"[axis] ChartDete load failed: {e}; skipping auto-calibration.")
+                return None, None
         detections = self.chartdete_module.detect_chart_elements(img, score_thr=0.3)
         self._last_detections = detections   # legend_patch/legend_label for legend mapping
         axis_info = self.chartdete_module.get_axis_info(detections, img=img, with_ocr=True)
@@ -494,7 +529,7 @@ class LineFormerApp:
         """
         from vlm_verifier import VLMVerifier
         if self.vlm is None:
-            self.vlm = VLMVerifier(verify_ssl=True)
+            self.vlm = _lazy_VLMVerifier()(verify_ssl=True)
         plot_area = self.cached_plot_area or self._detect_plot_area_only(img)
         if plot_area is None:
             raise RuntimeError("No plot area detected; cannot recalibrate axes.")
@@ -1044,12 +1079,12 @@ def main(page: ft.Page):
         return ft.Container(
             content=ft.Row(list(controls), spacing=6,
                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            bgcolor=SURFACE_2, border=ft.border.all(1, RULE), border_radius=8,
-            padding=ft.padding.symmetric(horizontal=8, vertical=6))
+            bgcolor=SURFACE_2, border=ft.Border.all(1, RULE), border_radius=8,
+            padding=ft.Padding.symmetric(horizontal=8, vertical=6))
 
     def _vsep():
         return ft.Container(width=1, height=26, bgcolor=RULE,
-                            margin=ft.margin.symmetric(horizontal=2))
+                            margin=ft.Margin.symmetric(horizontal=2))
 
     _btn_shape = ft.RoundedRectangleBorder(radius=10)
 
@@ -1063,19 +1098,21 @@ def main(page: ft.Page):
     progress_ring = ft.ProgressRing(visible=True, width=16, height=16)
     axis_status_text = ft.Text("Loading...", size=12, no_wrap=False)
 
-    input_image = ft.Image(visible=False, width=CANVAS_W, fit=ft.ImageFit.FIT_WIDTH)
-    result_image = ft.Image(visible=False, width=CANVAS_W, fit=ft.ImageFit.FIT_WIDTH)
+    # Flet 1.x requires `src` at construction; "" is fine — the actual image
+    # is assigned by setting .src = <base64> once a frame is ready.
+    input_image = ft.Image(src="", visible=False, width=CANVAS_W, fit=ft.BoxFit.FIT_WIDTH)
+    result_image = ft.Image(src="", visible=False, width=CANVAS_W, fit=ft.BoxFit.FIT_WIDTH)
 
     # Magnifier loupe shown while an edit tool (Erase / Add) is active: a
     # zoomed crop around the cursor with a crosshair (+ eraser outline).
     LOUPE_SIZE = 150      # on-screen diameter, px
     LOUPE_ZOOM = 3.0      # magnification relative to the displayed canvas
-    loupe_image = ft.Image(width=LOUPE_SIZE, height=LOUPE_SIZE,
-                           fit=ft.ImageFit.FILL)
+    loupe_image = ft.Image(src="", width=LOUPE_SIZE, height=LOUPE_SIZE,
+                           fit=ft.BoxFit.FILL)
     loupe_box = ft.Container(
         content=loupe_image, width=LOUPE_SIZE, height=LOUPE_SIZE,
         visible=False, left=0, top=0,
-        border=ft.border.all(2, ACCENT),
+        border=ft.Border.all(2, ACCENT),
         border_radius=LOUPE_SIZE // 2,
         clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
     )
@@ -1088,26 +1125,26 @@ def main(page: ft.Page):
     pdf_gallery_row = ft.Row(spacing=8, scroll=ft.ScrollMode.AUTO, wrap=False)
     pdf_gallery = ft.Container(
         content=ft.Column([
-            ft.Row([ft.Icon(ft.icons.COLLECTIONS_OUTLINED, size=15, color=ACCENT),
+            ft.Row([ft.Icon(ft.Icons.COLLECTIONS_OUTLINED, size=15, color=ACCENT),
                     pdf_gallery_title], spacing=6),
             pdf_gallery_hint,
             ft.Container(content=pdf_gallery_row, height=THUMB_W + 30,
-                         padding=6, border=ft.border.all(1, RULE),
+                         padding=6, border=ft.Border.all(1, RULE),
                          border_radius=10, bgcolor=SURFACE_2),
         ], spacing=6),
         visible=False, padding=14, bgcolor=SURFACE, border_radius=14,
-        border=ft.border.all(1, RULE), shadow=_card_shadow(),
+        border=ft.Border.all(1, RULE), shadow=_card_shadow(),
     )
 
     # Recrop button (enabled only for figures sourced from a PDF page).
     recrop_btn = ft.OutlinedButton(
-        "Recrop", icon=ft.icons.CROP, disabled=True,
+        "Recrop", icon=ft.Icons.CROP, disabled=True,
         tooltip="Re-crop this figure from its source PDF page (drag a new box). "
                 "Use when the auto-crop is too tight or too loose.",
     )
     delete_fig_btn = ft.OutlinedButton(
-        "Delete figure", icon=ft.icons.DELETE_OUTLINE, disabled=True,
-        icon_color=ft.colors.RED_400,
+        "Delete figure", icon=ft.Icons.DELETE_OUTLINE, disabled=True,
+        icon_color=ft.Colors.RED_400,
         tooltip="Remove the current figure from the gallery (e.g. a photo, "
                 "schematic, or non-chart) so it isn't digitized or uploaded.",
     )
@@ -1138,7 +1175,7 @@ def main(page: ft.Page):
 
     # Re-run the VLM detection + refinement agent on the current PDF.
     review_figures_btn = ft.OutlinedButton(
-        "AI Review Figures", icon=ft.icons.AUTO_FIX_HIGH, disabled=True,
+        "AI Review Figures", icon=ft.Icons.AUTO_FIX_HIGH, disabled=True,
         tooltip="Re-run AI detection and the box-refinement agent on the open PDF: "
                 "tightens crops, drops non-charts, and splits merged panels. "
                 "Rebuilds the figure gallery."
@@ -1148,7 +1185,7 @@ def main(page: ft.Page):
 
     # KMDS structured-metadata extraction (whole-PDF -> EN + JA JSON).
     kmds_btn = ft.OutlinedButton(
-        "Extract Metadata (KMDS)", icon=ft.icons.DATASET, disabled=True,
+        "Extract Metadata (KMDS)", icon=ft.Icons.DATASET, disabled=True,
         tooltip="Run the parallel KMDS extraction on the open PDF: bibliography, "
                 "materials, process, properties, figures -> structured EN + JA JSON. "
                 "Takes ~2-3 min and uses the Anthropic API."
@@ -1157,18 +1194,18 @@ def main(page: ft.Page):
 
     # Paper-record handoff to the KMDS viewer.
     save_fig_btn = ft.OutlinedButton(
-        "Save figure → record", icon=ft.icons.PLAYLIST_ADD,
+        "Save figure → record", icon=ft.Icons.PLAYLIST_ADD,
         tooltip="Stage the currently digitized figure (calibrated points + axes) "
                 "into the paper record.",
     )
     open_record_btn = ft.OutlinedButton(
-        "Open Paper Record", icon=ft.icons.MENU_BOOK, disabled=True,
+        "Open Paper Record", icon=ft.Icons.MENU_BOOK, disabled=True,
         tooltip="Build the KMDS paper record with your staged figure digitizations "
                 "and open it in the paper viewer (browser). Enabled once KMDS is "
                 "extracted or a figure is staged.",
     )
     sd3_upload_btn = ft.OutlinedButton(
-        "Upload approved → Starrydata3", icon=ft.icons.CLOUD_UPLOAD,
+        "Upload approved → Starrydata3", icon=ft.Icons.CLOUD_UPLOAD,
         tooltip="Upload ONLY the figures you approved (Axes OK + Extraction OK) "
                 "to your Starrydata3 database. Set the URL + key below.",
     )
@@ -1179,7 +1216,7 @@ def main(page: ft.Page):
     # what was recorded for the current figure — checked before approval
     review_props = ft.Text("", size=12, selectable=True, color=INK_3)
     sd2_upload_btn = ft.OutlinedButton(
-        "Upload approved → Starrydata2", icon=ft.icons.CLOUD_UPLOAD,
+        "Upload approved → Starrydata2", icon=ft.Icons.CLOUD_UPLOAD,
         tooltip="Upload ONLY the figures you approved to Starrydata2 (staging by "
                 "default) with your api-token (~/.sd2_token). NIMS network only.",
     )
@@ -1204,10 +1241,10 @@ def main(page: ft.Page):
     kmds_summary_text = ft.Text("", size=12, selectable=True)
     kmds_en_btn = ft.TextButton("English")
     kmds_ja_btn = ft.TextButton("日本語")
-    kmds_openfolder_btn = ft.TextButton("Open folder", icon=ft.icons.FOLDER_OPEN)
-    kmds_close_btn = ft.TextButton("Hide", icon=ft.icons.CLOSE)
-    kmds_save_btn = ft.FilledTonalButton("Save edits", icon=ft.icons.SAVE, disabled=True)
-    kmds_download_btn = ft.OutlinedButton("Download JSON…", icon=ft.icons.DOWNLOAD,
+    kmds_openfolder_btn = ft.TextButton("Open folder", icon=ft.Icons.FOLDER_OPEN)
+    kmds_close_btn = ft.TextButton("Hide", icon=ft.Icons.CLOSE)
+    kmds_save_btn = ft.FilledTonalButton("Save edits", icon=ft.Icons.SAVE, disabled=True)
+    kmds_download_btn = ft.OutlinedButton("Download JSON…", icon=ft.Icons.DOWNLOAD,
                                           disabled=True)
     kmds_edit_status = ft.Text("", size=12, color=INK_3, selectable=True)
     kmds_json_view = ft.TextField(
@@ -1218,13 +1255,26 @@ def main(page: ft.Page):
     # grouped under collapsible top-level sections (metadata, system, ...).
     kmds_fields_list = ft.ListView(spacing=4, height=440, padding=4)
     kmds_editor_state = {"record": None, "rows": []}   # rows: (path, original, TextField)
-    kmds_tabs = ft.Tabs(tabs=[
-        ft.Tab(text="Fields", content=ft.Container(kmds_fields_list, padding=4)),
-        ft.Tab(text="Raw JSON", content=ft.Container(kmds_json_view, padding=4)),
-    ], height=500)
+    # Flet 1.x splits Tabs into TabBar (labels) + TabBarView (bodies); the
+    # old ft.Tabs(tabs=[Tab(text, content)]) shortcut was removed. TabBarView
+    # must have a bounded height — give it an explicit one inside a Container.
+    kmds_tabs = ft.Tabs(
+        length=2,
+        content=ft.Column([
+            ft.TabBar(tabs=[ft.Tab(label="Fields"), ft.Tab(label="Raw JSON")]),
+            ft.Container(
+                content=ft.TabBarView(controls=[
+                    ft.Container(kmds_fields_list, padding=4),
+                    ft.Container(kmds_json_view, padding=4),
+                ]),
+                height=460,
+            ),
+        ]),
+        height=500,
+    )
     kmds_panel = ft.Container(
         content=ft.Column([
-            ft.Row([ft.Icon(ft.icons.DATASET_OUTLINED, size=18, color=ACCENT),
+            ft.Row([ft.Icon(ft.Icons.DATASET_OUTLINED, size=18, color=ACCENT),
                     kmds_title, ft.Container(expand=True),
                     kmds_en_btn, kmds_ja_btn, kmds_openfolder_btn, kmds_close_btn]),
             kmds_summary_text,
@@ -1232,7 +1282,7 @@ def main(page: ft.Page):
             kmds_tabs,
         ], spacing=6),
         visible=False, padding=14,
-        border=ft.border.all(1, RULE), border_radius=14,
+        border=ft.Border.all(1, RULE), border_radius=14,
         bgcolor=SURFACE, shadow=_card_shadow(),
     )
 
@@ -1280,18 +1330,18 @@ def main(page: ft.Page):
 
     # ---- Manual editing panel ----
     edit_status = ft.Text("", size=12, weight=ft.FontWeight.W_500)
-    erase_btn = ft.OutlinedButton("Erase", icon=ft.icons.CLEAR)
-    add_btn = ft.OutlinedButton("Add", icon=ft.icons.TIMELINE)
+    erase_btn = ft.OutlinedButton("Erase", icon=ft.Icons.CLEAR)
+    add_btn = ft.OutlinedButton("Add", icon=ft.Icons.TIMELINE)
     eraser_label = ft.Text("Eraser radius: 18", size=11, visible=False)
     eraser_slider = ft.Slider(min=6, max=40, value=18, divisions=34, label="{value}", width=200, visible=False)
     add_hint = ft.Text("", size=11, color=INK_3, visible=False)
-    apply_btn = ft.OutlinedButton("Apply spline", icon=ft.icons.CHECK, visible=False)
+    apply_btn = ft.OutlinedButton("Apply spline", icon=ft.Icons.CHECK, visible=False)
     undo_anchor_btn = ft.TextButton("Undo last point", visible=False)
     delete_line_btn = ft.OutlinedButton(
-        "Delete Line", icon=ft.icons.DELETE_OUTLINE,
+        "Delete Line", icon=ft.Icons.DELETE_OUTLINE,
         style=ft.ButtonStyle(color=ERR, shape=_btn_shape),
     )
-    done_btn = ft.OutlinedButton("Done editing", icon=ft.icons.DONE_ALL)
+    done_btn = ft.OutlinedButton("Done editing", icon=ft.Icons.DONE_ALL)
     edit_panel = ft.Column([
         edit_status,
         ft.Row([erase_btn, add_btn], spacing=6),
@@ -1323,7 +1373,7 @@ def main(page: ft.Page):
         label="Show", value="all", width=180,
         options=[ft.dropdown.Option("all", "All lines (combined)")],
     )
-    export_csv_btn = ft.OutlinedButton("Export CSV", icon=ft.icons.TABLE_VIEW, disabled=True)
+    export_csv_btn = ft.OutlinedButton("Export CSV", icon=ft.Icons.TABLE_VIEW, disabled=True)
     data_table = ft.DataTable(
         columns=[ft.DataColumn(ft.Text("(load an image to see data)"))],
         rows=[],
@@ -1337,7 +1387,7 @@ def main(page: ft.Page):
         content=ft.Row([data_table], scroll=ft.ScrollMode.AUTO),
         height=320, padding=6,
         bgcolor=SURFACE_2,
-        border=ft.border.all(1, RULE),
+        border=ft.Border.all(1, RULE),
         border_radius=10,
     )
     table_row_count_text = ft.Text("", size=11, color=INK_3)
@@ -1357,7 +1407,7 @@ def main(page: ft.Page):
         img = app.draw_points_on_image(app.current_image, app.data_series, app.axis_config,
                                        highlight_line_idx=highlight_idx)
         app.result_image = img          # loupe reads the rendered frame
-        result_image.src_base64 = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        result_image.src = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         page.update()
 
     def redraw_canvas():
@@ -1374,7 +1424,7 @@ def main(page: ft.Page):
                 for j in range(len(preview) - 1):
                     cv2.line(img, tuple(preview[j]), tuple(preview[j + 1]), (0, 0, 255), 2)
         app.result_image = img          # loupe reads the rendered frame
-        result_image.src_base64 = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        result_image.src = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         result_image.visible = True
         page.update()
 
@@ -1552,7 +1602,13 @@ def main(page: ft.Page):
     confirm_delete_dialog = ft.AlertDialog(modal=True, title=ft.Text("Delete this line?"))
 
     def _close_dialog():
-        confirm_delete_dialog.open = False
+        # Flet 1.x: page.dialog / .open were removed in favour of
+        # page.show_dialog() / page.close().
+        try:
+            page.close(confirm_delete_dialog)
+        except Exception:
+            # Fallback for environments that still honour .open.
+            confirm_delete_dialog.open = False
         page.update()
 
     def _confirm_delete_yes(_):
@@ -1590,8 +1646,7 @@ def main(page: ft.Page):
             ft.TextButton("Delete", on_click=_confirm_delete_yes,
                           style=ft.ButtonStyle(color=ERR)),
         ]
-        page.dialog = confirm_delete_dialog
-        confirm_delete_dialog.open = True
+        page.show_dialog(confirm_delete_dialog)
         page.update()
 
     erase_btn.on_click = on_erase_click
@@ -1616,7 +1671,7 @@ def main(page: ft.Page):
             swatch = ft.Container(width=12, height=12,
                                   bgcolor=_bgr_to_hex(colors[idx]),
                                   border_radius=6,
-                                  border=ft.border.all(1, RULE))
+                                  border=ft.Border.all(1, RULE))
             name = ft.Text(app.line_name(idx), size=12,
                            weight=ft.FontWeight.W_500, color=INK)
             pts = ft.Text(f"{len(series['points'])} pts", size=10, color=INK_3)
@@ -1633,10 +1688,10 @@ def main(page: ft.Page):
                 content=ft.Row([swatch, name, ft.Container(expand=True), pts],
                                spacing=8,
                                vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                padding=ft.Padding.symmetric(horizontal=8, vertical=6),
                 border_radius=8,
                 bgcolor=SELECT if selected else None,
-                border=ft.border.all(1, ACCENT if selected else "#00000000"),
+                border=ft.Border.all(1, ACCENT if selected else "#00000000"),
                 on_hover=on_hover, on_click=on_click_row, ink=True,
             )
             detected_lines_column.controls.append(row)
@@ -1654,7 +1709,7 @@ def main(page: ft.Page):
         _hide_edit_subcontrols()
         app.data_series = app.apply_downsample_and_sort()
         app.result_image = app.draw_points_on_image(app.current_image, app.data_series, app.axis_config)
-        result_image.src_base64 = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
+        result_image.src = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
         result_image.visible = True
         total_points = sum(len(s['points']) for s in app.data_series)
         line_pts = [len(s['points']) for s in app.data_series]
@@ -1752,7 +1807,7 @@ def main(page: ft.Page):
         try:
             if VLM_VERIFIER_AVAILABLE and os.environ.get("ANTHROPIC_API_KEY"):
                 if app.vlm is None:
-                    app.vlm = VLMVerifier(verify_ssl=True)
+                    app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                 props = app.vlm.canonicalize_properties(unmatched)
                 entries = [{**p, "added_by": "claude"} for p in props
                            if isinstance(p, dict) and p.get("is_property")
@@ -1840,7 +1895,7 @@ def main(page: ft.Page):
             try:
                 from vlm_verifier import VLMVerifier
                 if app.vlm is None:
-                    app.vlm = VLMVerifier(verify_ssl=True)
+                    app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                 res = app.vlm.read_axis_properties(app.current_image)
 
                 def fmt(ax):
@@ -1930,7 +1985,7 @@ def main(page: ft.Page):
             r_loupe = int(app.eraser_radius * LOUPE_SIZE / (2.0 * src_r))
             if 2 <= r_loupe <= LOUPE_SIZE:
                 cv2.circle(vis, (c, c), r_loupe, (0, 0, 255), 1)
-        loupe_image.src_base64 = image_to_base64(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        loupe_image.src = image_to_base64(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
 
         # place the loupe up-right of the cursor, flipping near canvas edges
         left = lx + 24
@@ -2012,7 +2067,7 @@ def main(page: ft.Page):
         try:
             app.data_series = app.extract_lines(app.current_image)
             app.result_image = app.draw_points_on_image(app.current_image, app.data_series, app.axis_config)
-            result_image.src_base64 = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
+            result_image.src = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
             result_image.visible = True
             total_points = sum(len(s['points']) for s in app.data_series)
             line_pts = [len(s['points']) for s in app.data_series]
@@ -2029,7 +2084,7 @@ def main(page: ft.Page):
                     page.update()
                     app.axis_config, app.ocr_results = app.detect_axis_calibration(app.current_image)
                     app.result_image = app.draw_points_on_image(app.current_image, app.data_series, app.axis_config)
-                    result_image.src_base64 = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
+                    result_image.src = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
                     # Auto-fill axis names from OCR; remember what was DETECTED
                     # so the verification panel can show it next to any edits.
                     x_name, y_name = app.get_axis_titles()
@@ -2054,7 +2109,7 @@ def main(page: ft.Page):
                                    and bool(os.environ.get("ANTHROPIC_API_KEY")))
                         if can_vlm and fidx not in app._vlm_axes_read:
                             if app.vlm is None:
-                                app.vlm = VLMVerifier(verify_ssl=True)
+                                app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                             process_status_text.value = "Reading the axes with Claude…"
                             page.update()
                             res = app.vlm.read_axis_properties(app.current_image)
@@ -2095,7 +2150,7 @@ def main(page: ft.Page):
                             try:
                                 import line_utils
                                 if app.vlm is None:
-                                    app.vlm = VLMVerifier(verify_ssl=True)
+                                    app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                                 process_status_text.value = "Reading the legend with Claude…"
                                 page.update()
                                 colors = list(line_utils.get_distinct_colors(len(app.data_series)))
@@ -2174,7 +2229,7 @@ def main(page: ft.Page):
         recrop_btn.disabled = not (figure_idx is not None and app.pdf_path
                                    and PDF_SUPPORT)
         delete_fig_btn.disabled = figure_idx is None or not app.pdf_figures
-        input_image.src_base64 = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        input_image.src = image_to_base64(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         input_image.visible = True
         try:
             _sync_review_ui()          # reflect this figure's Axes/Extraction checks
@@ -2274,8 +2329,58 @@ def main(page: ft.Page):
             paste_from_clipboard()
 
     page.on_keyboard_event = on_keyboard
-    file_picker = ft.FilePicker(on_result=pick_files_result)
-    page.overlay.append(file_picker)
+    file_picker = ft.FilePicker()  # Flet 1.1: on_result no longer fires from pick_files()
+    page.services.append(file_picker)
+
+    # ---- FilePicker bridge for the Flet 1.1 async API ----
+    # In 0.24, FilePicker.pick_files() / save_file() triggered the picker's
+    # on_result event. In 1.1 those methods are async and return the picked
+    # files / path directly; the on_result event is reserved for a different
+    # (declarative) action. We keep the old handler bodies intact and bridge
+    # them: await the picker, then fire the handler with a tiny event shim.
+    class _PickEvent:
+        __slots__ = ("files", "path")
+        def __init__(self, files=None, path=None):
+            self.files = files or []
+            self.path = path
+
+    def _pick_files_bridge(picker, handler, allowed_extensions=None,
+                            allow_multiple=False, dialog_title=None):
+        async def _run():
+            kw = {}
+            if allowed_extensions:
+                kw["file_type"] = ft.FilePickerFileType.CUSTOM
+                kw["allowed_extensions"] = allowed_extensions
+            if allow_multiple:
+                kw["allow_multiple"] = True
+            if dialog_title:
+                kw["dialog_title"] = dialog_title
+            try:
+                files = await picker.pick_files(**kw)
+            except Exception as ex:
+                print(f"[picker] pick_files failed: {ex}")
+                return
+            handler(_PickEvent(files=files))
+        page.run_task(_run)
+
+    def _save_file_bridge(picker, handler, *, file_name=None,
+                           allowed_extensions=None, dialog_title=None):
+        async def _run():
+            kw = {}
+            if allowed_extensions:
+                kw["file_type"] = ft.FilePickerFileType.CUSTOM
+                kw["allowed_extensions"] = allowed_extensions
+            if file_name:
+                kw["file_name"] = file_name
+            if dialog_title:
+                kw["dialog_title"] = dialog_title
+            try:
+                path = await picker.save_file(**kw)
+            except Exception as ex:
+                print(f"[picker] save_file failed: {ex}")
+                return
+            handler(_PickEvent(path=path))
+        page.run_task(_run)
 
     # ---- PDF -> figure gallery ----
     def make_thumb_b64(img_bgr, max_w=THUMB_W):
@@ -2323,23 +2428,23 @@ def main(page: ft.Page):
             label = caption[:22] if caption else f"p{meta.get('page', '?')} #{meta.get('img_idx_on_page', idx + 1)}"
             # review badge: ✓ approved (green), • digitized-not-approved (amber)
             if idx in approved:
-                badge = ft.Text("✓ approved", size=9, color=ft.colors.GREEN,
+                badge = ft.Text("✓ approved", size=9, color=ft.Colors.GREEN,
                                 weight=ft.FontWeight.BOLD)
             elif idx in app.fig_digitizations:
-                badge = ft.Text("• review", size=9, color=ft.colors.AMBER_800)
+                badge = ft.Text("• review", size=9, color=ft.Colors.AMBER_800)
             else:
                 badge = ft.Text("", size=9)
             tile = ft.Container(
                 content=ft.Column([
-                    ft.Image(src_base64=thumb_b64, width=THUMB_W,
-                             fit=ft.ImageFit.FIT_WIDTH),
+                    ft.Image(src=thumb_b64, width=THUMB_W,
+                             fit=ft.BoxFit.FIT_WIDTH),
                     ft.Text(label, size=10, no_wrap=True,
                             color=INK_3),
                     badge,
                 ], spacing=3, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
                 padding=6, border_radius=10,
                 bgcolor=SELECT if selected else SURFACE,
-                border=ft.border.all(2, ft.colors.GREEN if idx in approved
+                border=ft.Border.all(2, ft.Colors.GREEN if idx in approved
                                      else (ACCENT if selected else RULE)),
                 on_click=lambda e, _i=idx: on_thumbnail_click(_i),
                 ink=True, tooltip=caption or label,
@@ -2430,6 +2535,7 @@ def main(page: ft.Page):
             kmds_ja_btn.disabled = not kmds_paths["ja"]
             kmds_panel.visible = True
             open_record_btn.disabled = False
+            _update_paper_info()
             process_status_text.value = (process_status_text.value +
                                          "  ·  reusing saved KMDS metadata")
         except Exception as ex:  # noqa: BLE001
@@ -2444,8 +2550,8 @@ def main(page: ft.Page):
                 return
             page.run_thread(lambda: run_pdf_extraction(pdf_path))
 
-    pdf_picker = ft.FilePicker(on_result=pick_pdf_result)
-    page.overlay.append(pdf_picker)
+    pdf_picker = ft.FilePicker()
+    page.services.append(pdf_picker)
 
     def on_review_figures_click(_):
         if not (app.pdf_path and str(app.pdf_path).lower().endswith(".pdf")
@@ -2462,7 +2568,7 @@ def main(page: ft.Page):
                     "disp_scale": 1.0, "start": None, "box": None}
     RECROP_DISP_W = 760
 
-    recrop_image = ft.Image(width=RECROP_DISP_W, fit=ft.ImageFit.FIT_WIDTH)
+    recrop_image = ft.Image(src="", width=RECROP_DISP_W, fit=ft.BoxFit.FIT_WIDTH)
     recrop_status = ft.Text("Drag a rectangle over the chart, then Apply crop.",
                             size=12, color=INK_3)
     recrop_dialog = ft.AlertDialog(modal=True, title=ft.Text("Recrop figure"))
@@ -2477,7 +2583,7 @@ def main(page: ft.Page):
             x0, y0, x1, y1 = box
             cv2.rectangle(disp, (int(x0), int(y0)), (int(x1), int(y1)),
                           (0, 0, 255), 2)
-        recrop_image.src_base64 = image_to_base64(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+        recrop_image.src = image_to_base64(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
         page.update()
 
     def on_recrop_pan_start(e):
@@ -2500,7 +2606,10 @@ def main(page: ft.Page):
         _render_recrop_overlay()
 
     def _close_recrop():
-        recrop_dialog.open = False
+        try:
+            page.close(recrop_dialog)
+        except Exception:
+            recrop_dialog.open = False
         page.update()
 
     def on_recrop_apply(_):
@@ -2556,7 +2665,8 @@ def main(page: ft.Page):
             # Render the page at high DPI for the *actual* crop quality, and
             # keep a separate downscaled copy just for the on-screen gesture.
             recrop_dpi = 200
-            full_page, zoom = render_pdf_page(app.pdf_path, page_no, dpi=recrop_dpi)
+            full_page, zoom = _lazy_pdf_figures().render_pdf_page(
+                app.pdf_path, page_no, dpi=recrop_dpi)
             if full_page is None:
                 process_status_text.value = "Could not render source page."
                 page.update()
@@ -2584,8 +2694,7 @@ def main(page: ft.Page):
             recrop_state["box"] = seed
             _render_recrop_overlay()
             process_status_text.value = ""
-            page.dialog = recrop_dialog
-            recrop_dialog.open = True
+            page.show_dialog(recrop_dialog)
             page.update()
 
         page.run_thread(_open_recrop)
@@ -2599,11 +2708,11 @@ def main(page: ft.Page):
     )
     recrop_dialog.content = ft.Column([
         recrop_status,
-        ft.Container(content=recrop_gesture, alignment=ft.alignment.center),
+        ft.Container(content=recrop_gesture, alignment=ft.Alignment.CENTER),
     ], tight=True, scroll=ft.ScrollMode.AUTO, width=RECROP_DISP_W + 20, height=620)
     recrop_dialog.actions = [
         ft.TextButton("Cancel", on_click=lambda e: _close_recrop()),
-        ft.FilledButton("Apply crop", icon=ft.icons.CHECK, on_click=on_recrop_apply),
+        ft.FilledButton("Apply crop", icon=ft.Icons.CHECK, on_click=on_recrop_apply),
     ]
     recrop_btn.on_click = on_recrop_click
 
@@ -2666,7 +2775,7 @@ def main(page: ft.Page):
                 section = path[0]
                 kmds_fields_list.controls.append(ft.Container(
                     ft.Text(str(section), size=13, weight=ft.FontWeight.BOLD),
-                    padding=ft.padding.only(top=10)))
+                    padding=ft.Padding.only(top=10)))
             tf = ft.TextField(
                 value=leaf_to_text(value), label=label, dense=True,
                 text_size=12, multiline=True, max_lines=3,
@@ -2742,14 +2851,14 @@ def main(page: ft.Page):
             kmds_edit_status.value = f"Download failed: {ex}"
         page.update()
 
-    kmds_download_picker = ft.FilePicker(on_result=_kmds_download_result)
+    kmds_download_picker = ft.FilePicker()
 
     def _on_kmds_download(_):
         if kmds_editor_state["record"] is None:
             return
         base = os.path.basename(kmds_paths["current"] or "kmds_record.json")
-        kmds_download_picker.save_file(
-            file_name=base, allowed_extensions=["json"])
+        _save_file_bridge(kmds_download_picker, _kmds_download_result,
+                          file_name=base, allowed_extensions=["json"])
 
     kmds_save_btn.on_click = _on_kmds_save
     kmds_download_btn.on_click = _on_kmds_download
@@ -2842,9 +2951,10 @@ def main(page: ft.Page):
                     # KMDS_MODEL=gemini-3.5-flash switches extraction (and the
                     # background JA pass) to Gemini's free tier — needs
                     # GEMINI_API_KEY or GOOGLE_API_KEY instead of the Anthropic key.
-                    summary = asyncio.run(kmds_parallel.extract_kmds_parallel(
+                    _kp = _lazy_kmds_parallel()
+                    summary = asyncio.run(_kp.extract_kmds_parallel(
                         app.pdf_path, out_dir, base_name=base, prompt_path=prompt_path,
-                        model=os.environ.get("KMDS_MODEL") or kmds_parallel.MODEL,
+                        model=os.environ.get("KMDS_MODEL") or _kp.MODEL,
                         translate=False,
                     ))
                 except Exception as ex:
@@ -2868,6 +2978,7 @@ def main(page: ft.Page):
                         app.kmds_record = json.load(_rf)
                 except Exception:
                     app.kmds_record = None
+                _update_paper_info()
                 n_ok = summary.get("n_sections_ok", 0)
                 n_tot = summary.get("n_sections", 0)
                 elapsed = summary.get("elapsed_sec", 0)
@@ -2919,10 +3030,11 @@ def main(page: ft.Page):
                 if n_ok and kmds_paths["en"]:
                     ja_target = os.path.join(out_dir, f"{base}_ja.json")
                     _kmds_model = os.environ.get("KMDS_MODEL", "")
+                    _kp = _lazy_kmds_parallel()
                     _tr_model = (_kmds_model if _kmds_model.startswith("gemini")
-                                 else kmds_parallel.TRANSLATION_MODEL)
+                                 else _kp.TRANSLATION_MODEL)
                     try:
-                        tr = asyncio.run(kmds_parallel.translate_record_file(
+                        tr = asyncio.run(_kp.translate_record_file(
                             kmds_paths["en"], ja_target, prompt_path=prompt_path,
                             model=_tr_model))
                     except Exception as ex:
@@ -3568,8 +3680,8 @@ def main(page: ft.Page):
             process_status_text.value = f"Saved: {e.path}"
             page.update()
 
-    save_sd_picker = ft.FilePicker(on_result=save_sd_result)
-    save_wpd_picker = ft.FilePicker(on_result=save_wpd_result)
+    save_sd_picker = ft.FilePicker()
+    save_wpd_picker = ft.FilePicker()
 
     # CSV export picker
     def save_csv_result(e: ft.FilePickerResultEvent):
@@ -3584,15 +3696,14 @@ def main(page: ft.Page):
                 process_status_text.value = f"CSV save failed: {ex}"
             page.update()
 
-    save_csv_picker = ft.FilePicker(on_result=save_csv_result)
+    save_csv_picker = ft.FilePicker()
 
     def on_export_csv_click(_):
         if not app.data_series:
             return
-        save_csv_picker.save_file(
+        _save_file_bridge(save_csv_picker, save_csv_result,
             file_name=f"data-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
-            allowed_extensions=["csv"],
-        )
+            allowed_extensions=["csv"])
 
     export_csv_btn.on_click = on_export_csv_click
 
@@ -3671,9 +3782,10 @@ def main(page: ft.Page):
                         page.update()
                 page.run_thread(load_imported)
 
-    model_import_picker = ft.FilePicker(on_result=import_model_result)
-    page.overlay.extend([save_sd_picker, save_wpd_picker, save_csv_picker,
-                         model_import_picker, kmds_download_picker])
+    model_import_picker = ft.FilePicker()
+    # Flet 1.x: FilePicker is a Service, not an overlay control.
+    page.services.extend([save_sd_picker, save_wpd_picker, save_csv_picker,
+                          model_import_picker, kmds_download_picker])
 
     def on_model_change(e):
         key = model_dropdown.value
@@ -3720,16 +3832,15 @@ def main(page: ft.Page):
 
                     def on_import_finetune(_, _key=key):
                         _model_import_context["mode"] = f"finetune:{_key}"
-                        model_import_picker.pick_files(
+                        _pick_files_bridge(model_import_picker, import_model_result,
                             allowed_extensions=["pth"],
-                            dialog_title=f"Select {hf_filename}",
-                        )
+                            dialog_title=f"Select {hf_filename}")
 
                     download_help = ft.Column([
                         ft.Text("Download failed.", color=ERR),
                         ft.Text(f"Download '{hf_filename}' from:", no_wrap=False),
                         ft.TextButton("HuggingFace", url=HUGGINGFACE_MODELS_URL),
-                        ft.FilledTonalButton("Import Model", icon=ft.icons.FILE_UPLOAD,
+                        ft.FilledTonalButton("Import Model", icon=ft.Icons.FILE_UPLOAD,
                                           on_click=on_import_finetune),
                     ], spacing=5)
                     clear_download_help()
@@ -3745,12 +3856,13 @@ def main(page: ft.Page):
     model_dropdown.on_change = on_model_change
 
     upload_btn = ft.FilledButton(
-        "Open Image (or Cmd+V)", icon=ft.icons.FOLDER_OPEN,
-        on_click=lambda _: file_picker.pick_files(allowed_extensions=["png", "jpg", "jpeg", "bmp", "tiff"]),
+        "Open Image (or Cmd+V)", icon=ft.Icons.FOLDER_OPEN,
+        on_click=lambda _: _pick_files_bridge(file_picker, pick_files_result,
+            allowed_extensions=["png", "jpg", "jpeg", "bmp", "tiff"]),
     )
 
     paste_btn = ft.OutlinedButton(
-        "Paste", icon=ft.icons.CONTENT_PASTE,
+        "Paste", icon=ft.Icons.CONTENT_PASTE,
         tooltip="Paste an image from the clipboard (Cmd+V). "
                 "Screenshots taken with Ctrl+Cmd+Shift+4 or images copied from "
                 "any app can be pasted here without saving them first.",
@@ -3758,38 +3870,39 @@ def main(page: ft.Page):
     )
 
     open_pdf_btn = ft.FilledButton(
-        "Open PDF", icon=ft.icons.PICTURE_AS_PDF, disabled=not PDF_SUPPORT,
+        "Open PDF", icon=ft.Icons.PICTURE_AS_PDF, disabled=not PDF_SUPPORT,
         tooltip="Extract all chart figures from a PDF and edit each one."
                 if PDF_SUPPORT else "PDF support requires PyMuPDF (pip install pymupdf).",
-        on_click=lambda _: pdf_picker.pick_files(allowed_extensions=["pdf"]),
+        on_click=lambda _: _pick_files_bridge(pdf_picker, pick_pdf_result,
+            allowed_extensions=["pdf"]),
     )
 
     export_sd_btn = ft.OutlinedButton(
-        "Export .zip", icon=ft.icons.DOWNLOAD, disabled=True,
-        on_click=lambda _: save_sd_picker.save_file(
+        "Export .zip", icon=ft.Icons.DOWNLOAD, disabled=True,
+        on_click=lambda _: _save_file_bridge(save_sd_picker, save_sd_result,
             file_name=f"sd-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip",
             allowed_extensions=["zip"]),
     )
 
     export_wpd_btn = ft.OutlinedButton(
-        "Export .tar", icon=ft.icons.DOWNLOAD, disabled=True,
-        on_click=lambda _: save_wpd_picker.save_file(
+        "Export .tar", icon=ft.Icons.DOWNLOAD, disabled=True,
+        on_click=lambda _: _save_file_bridge(save_wpd_picker, save_wpd_result,
             file_name=f"wpd-{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar",
             allowed_extensions=["tar"]),
     )
 
     verify_btn = ft.OutlinedButton(
-        "Verify with AI", icon=ft.icons.AUTO_FIX_HIGH, disabled=True,
+        "Verify with AI", icon=ft.Icons.AUTO_FIX_HIGH, disabled=True,
         tooltip="Send current extraction to Claude to fix missing/stray points. Needs ANTHROPIC_API_KEY.",
     )
 
     detect_markers_btn = ft.OutlinedButton(
-        "Detect Markers", icon=ft.icons.RADIO_BUTTON_CHECKED, disabled=True,
+        "Detect Markers", icon=ft.Icons.RADIO_BUTTON_CHECKED, disabled=True,
         tooltip="Replace each line's points with actual marker positions, detected via color-thickness peaks along the LineFormer trace. Best for sparse marker charts (e.g. thermoelectric data).",
     )
 
     scatter_btn = ft.OutlinedButton(
-        "Detect points (scatter)", icon=ft.icons.SCATTER_PLOT, disabled=True,
+        "Detect points (scatter)", icon=ft.Icons.SCATTER_PLOT, disabled=True,
         tooltip="Find data points DIRECTLY (no line tracing): filled markers via "
                 "distance transform, hollow markers via enclosed background holes; "
                 "series grouped by color AND marker shape (circle/triangle/square/"
@@ -3798,14 +3911,14 @@ def main(page: ft.Page):
     )
 
     axis_fix_btn = ft.OutlinedButton(
-        "Fix Axis (AI)", icon=ft.icons.STRAIGHTEN, disabled=True,
+        "Fix Axis (AI)", icon=ft.Icons.STRAIGHTEN, disabled=True,
         tooltip="Use Claude to read the axis tick labels — including scientific "
                 "notation (10^-4) and log scales — and recalibrate the axes. "
                 "Needs ANTHROPIC_API_KEY.",
     )
 
     label_lines_btn = ft.OutlinedButton(
-        "Label Lines (AI)", icon=ft.icons.LABEL, disabled=True,
+        "Label Lines (AI)", icon=ft.Icons.LABEL, disabled=True,
         tooltip="Use Claude to read the chart legend and name each detected line "
                 "(which line is which series). Needs ANTHROPIC_API_KEY.",
     )
@@ -3821,7 +3934,7 @@ def main(page: ft.Page):
             try:
                 import line_utils
                 if app.vlm is None:
-                    app.vlm = VLMVerifier(verify_ssl=True)
+                    app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                 colors = list(line_utils.get_distinct_colors(len(app.data_series)))
                 labels = app.vlm.label_lines_by_legend(
                     app.current_image, app.data_series, colors=colors,
@@ -3836,7 +3949,7 @@ def main(page: ft.Page):
                             app.data_series[i].pop("label", None)
                 app.result_image = app.draw_points_on_image(
                     app.current_image, app.data_series, app.axis_config)
-                result_image.src_base64 = image_to_base64(
+                result_image.src = image_to_base64(
                     cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
                 result_image.visible = True
                 populate_detected_lines()
@@ -3872,7 +3985,7 @@ def main(page: ft.Page):
                     # Redraw overlay + refresh the calibrated data table.
                     app.result_image = app.draw_points_on_image(
                         app.current_image, app.data_series or [], app.axis_config)
-                    result_image.src_base64 = image_to_base64(
+                    result_image.src = image_to_base64(
                         cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
                     result_image.visible = True
                     axis_info_text.value = (
@@ -3911,7 +4024,7 @@ def main(page: ft.Page):
             try:
                 import line_utils
                 if app.vlm is None:
-                    app.vlm = VLMVerifier(verify_ssl=True)
+                    app.vlm = _lazy_VLMVerifier()(verify_ssl=True)
                 colors = list(line_utils.get_distinct_colors(len(app.data_series)))
                 corrected, debug = app.vlm.verify_and_correct(
                     app.current_image, app.data_series,
@@ -3922,7 +4035,7 @@ def main(page: ft.Page):
                 app.data_series = corrected
                 app.raw_lines = [list(s["points"]) for s in corrected]
                 app.result_image = app.draw_points_on_image(app.current_image, app.data_series, app.axis_config)
-                result_image.src_base64 = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
+                result_image.src = image_to_base64(cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
                 result_image.visible = True
                 total_points = sum(len(s["points"]) for s in app.data_series)
                 line_pts = [len(s["points"]) for s in app.data_series]
@@ -3970,7 +4083,7 @@ def main(page: ft.Page):
                     if len(curve) < 3:
                         new_series_unsorted.append({"points": []})
                         continue
-                    markers, _color_lab, _thick = find_markers_on_traced_line(
+                    markers, _color_lab, _thick = _lazy_find_markers()(
                         app.current_image, curve,
                         color_tol_lab=12.0,
                         min_marker_thickness=3.5,
@@ -3990,7 +4103,7 @@ def main(page: ft.Page):
                 app.result_image = app.draw_points_on_image(
                     app.current_image, app.data_series, app.axis_config
                 )
-                result_image.src_base64 = image_to_base64(
+                result_image.src = image_to_base64(
                     cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB)
                 )
                 result_image.visible = True
@@ -4073,7 +4186,7 @@ def main(page: ft.Page):
                     print(f"[scatter-legend] {ex}")
                 app.result_image = app.draw_points_on_image(
                     app.current_image, app.data_series, app.axis_config)
-                result_image.src_base64 = image_to_base64(
+                result_image.src = image_to_base64(
                     cv2.cvtColor(app.result_image, cv2.COLOR_BGR2RGB))
                 populate_detected_lines()
                 update_data_table()
@@ -4142,18 +4255,18 @@ def main(page: ft.Page):
 
     settings_panel = ft.Container(
         content=ft.Column([
-            _section_header(ft.icons.MEMORY, "Models"),
+            _section_header(ft.Icons.MEMORY, "Models"),
             model_dropdown,
             _status_pill(progress_ring, status_text),
             axis_model_dropdown,
             _status_pill(axis_status_text),
             sort_dropdown,
             _soft_divider(),
-            _section_header(ft.icons.KEY, "Claude API"),
+            _section_header(ft.Icons.KEY, "Claude API"),
             api_key_field,
             ft.Row([api_key_save_btn, api_key_status], spacing=8),
             _soft_divider(),
-            _section_header(ft.icons.TUNE, "Sampling"),
+            _section_header(ft.Icons.TUNE, "Sampling"),
             downsample_dropdown,
             max_points_label, max_points_slider,
             fixed_step_label, fixed_step_slider,
@@ -4162,22 +4275,22 @@ def main(page: ft.Page):
             detected_lines_hint,
             detected_lines_column,
             edit_panel,
-            _section_header(ft.icons.AUTO_AWESOME, "AI tools"),
+            _section_header(ft.Icons.AUTO_AWESOME, "AI tools"),
             verify_btn,
             detect_markers_btn,
             scatter_btn,
             axis_fix_btn,
             label_lines_btn,
             _soft_divider(),
-            _section_header(ft.icons.LAUNCH, "Adjust in digitizer"),
+            _section_header(ft.Icons.LAUNCH, "Adjust in digitizer"),
             ft.Text("StarryDigitizer", size=13, weight=ft.FontWeight.W_500, color=INK),
             ft.Row([export_sd_btn,
-                    ft.IconButton(icon=ft.icons.OPEN_IN_NEW, icon_size=18,
+                    ft.IconButton(icon=ft.Icons.OPEN_IN_NEW, icon_size=18,
                                   icon_color=ACCENT, tooltip="Open StarryDigitizer",
                                   url="https://starrydigitizer.vercel.app/")], spacing=0),
             ft.Text("WebPlotDigitizer", size=13, weight=ft.FontWeight.W_500, color=INK),
             ft.Row([export_wpd_btn,
-                    ft.IconButton(icon=ft.icons.OPEN_IN_NEW, icon_size=18,
+                    ft.IconButton(icon=ft.Icons.OPEN_IN_NEW, icon_size=18,
                                   icon_color=ACCENT, tooltip="Open WebPlotDigitizer",
                                   url="https://apps.automeris.io/wpd/")], spacing=0),
             ft.Container(expand=True),
@@ -4185,8 +4298,8 @@ def main(page: ft.Page):
         ], spacing=9, expand=True, scroll=ft.ScrollMode.AUTO),
         width=290, padding=16,
         bgcolor=SURFACE, border_radius=14,
-        border=ft.border.all(1, RULE), shadow=_card_shadow(),
-        margin=ft.margin.only(right=4),
+        border=ft.Border.all(1, RULE), shadow=_card_shadow(),
+        margin=ft.Margin.only(right=4),
     )
 
     process_status_text = ft.Text("", size=12)
@@ -4205,11 +4318,11 @@ def main(page: ft.Page):
 
     def _card(content, pad=14):
         return ft.Container(content=content, padding=pad, bgcolor=SURFACE,
-                            border_radius=14, border=ft.border.all(1, RULE),
+                            border_radius=14, border=ft.Border.all(1, RULE),
                             shadow=_card_shadow())
 
     data_table_section = _card(ft.Column([
-        ft.Row([ft.Icon(ft.icons.TABLE_CHART_OUTLINED, size=18, color=ACCENT),
+        ft.Row([ft.Icon(ft.Icons.TABLE_CHART_OUTLINED, size=18, color=ACCENT),
                 data_table_title, ft.Container(expand=True), export_csv_btn]),
         ft.Row([x_axis_name_field, y_axis_name_field, axis_claude_btn, save_axes_btn,
                 table_line_picker], spacing=10, wrap=True, run_spacing=6),
@@ -4218,31 +4331,174 @@ def main(page: ft.Page):
         data_table_scroll,
     ], spacing=8))
 
-    toolbar_card = _card(
+    # Clear button — reset app state without quitting, so the next paper can
+    # be opened on the same running instance.
+    clear_btn = ft.OutlinedButton(
+        "Clear", icon=ft.Icons.CLEAR_ALL,
+        tooltip="Reset PDF / figures / extraction / KMDS. Keep the app running.",
+        style=ft.ButtonStyle(shape=_btn_shape),
+    )
+
+    # Paper info strip — title / authors / journal / DOI pulled from the KMDS
+    # record once extraction has succeeded (or an on-disk record is reused).
+    paper_title_text = ft.Text("", size=15, weight=ft.FontWeight.BOLD, color=INK,
+                               selectable=True)
+    paper_authors_text = ft.Text("", size=12, color=INK_3, selectable=True)
+    paper_journal_text = ft.Text("", size=12, color=INK_3, selectable=True)
+    paper_doi_link = ft.TextButton("", icon=ft.Icons.OPEN_IN_NEW,
+                                   visible=False)
+    paper_info_card = _card(
         ft.Column([
-            ft.Row([upload_btn, paste_btn, open_pdf_btn,
-                    _vsep(),
-                    pdf_detector_dropdown, review_figures_btn, recrop_btn, delete_fig_btn,
-                    _vsep(),
-                    kmds_btn, save_fig_btn, open_record_btn],
-                   alignment=ft.MainAxisAlignment.START,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                   wrap=True, run_spacing=8, spacing=8),
-            ft.Row([axes_ok_check, extraction_ok_check, review_status],
-                   alignment=ft.MainAxisAlignment.START,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                   wrap=True, run_spacing=8, spacing=8),
-            review_props,
-            ft.Row([sd2_upload_btn, sd2_url_field],
-                   alignment=ft.MainAxisAlignment.START,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                   wrap=True, run_spacing=8, spacing=8),
-            ft.Row([sd3_upload_btn, sd3_url_field, sd3_key_field],
-                   alignment=ft.MainAxisAlignment.START,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                   wrap=True, run_spacing=8, spacing=8),
-            ft.Row([process_progress_ring, process_status_text],
-                   spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            _section_header(ft.Icons.ARTICLE, "Paper"),
+            paper_title_text,
+            paper_authors_text,
+            paper_journal_text,
+            paper_doi_link,
+        ], spacing=4),
+        pad=12,
+    )
+    paper_info_card.visible = False
+
+    def _update_paper_info():
+        """Refresh the paper strip from app.kmds_record. No-op if not loaded."""
+        rec = app.kmds_record or {}
+        pub = (rec.get("metadata") or {}).get("publication") or {}
+        if not pub:
+            paper_info_card.visible = False
+            return
+        title = pub.get("title") or "(no title)"
+        authors_raw = pub.get("authors") or []
+        names = []
+        for a in authors_raw[:3]:
+            if isinstance(a, dict):
+                raw_nm = (a.get("name") or a.get("full_name") or
+                          " ".join(str(x) for x in
+                                   (a.get("given_name"), a.get("family_name"))
+                                   if isinstance(x, str) and x))
+                nm = raw_nm if isinstance(raw_nm, str) else ""
+            else:
+                nm = str(a) if a is not None else ""
+            if nm:
+                names.append(nm)
+        authors_str = ", ".join(names)
+        if len(authors_raw) > 3:
+            authors_str = (authors_str + " et al.") if authors_str else "et al."
+        journal = pub.get("journal") or ""
+        year = pub.get("year") or ""
+        vol = pub.get("volume") or ""
+        issue = pub.get("issue") or ""
+        pages = pub.get("pages") or ""
+        bits = [b for b in [journal, (str(year) if year else ""),
+                             (f"vol. {vol}" if vol else ""),
+                             (f"no. {issue}" if issue else ""),
+                             (f"pp. {pages}" if pages else "")] if b]
+        doi = pub.get("doi") or ""
+        paper_title_text.value = title
+        paper_authors_text.value = authors_str or "(authors not extracted)"
+        paper_journal_text.value = " · ".join(bits)
+        if doi:
+            paper_doi_link.text = f"DOI: {doi}"
+            paper_doi_link.url = (doi if doi.startswith("http")
+                                  else f"https://doi.org/{doi}")
+            paper_doi_link.visible = True
+        else:
+            paper_doi_link.visible = False
+        paper_info_card.visible = True
+
+    def on_clear(_):
+        """Reset everything so a fresh paper can be loaded without restarting."""
+        # App state
+        app.pdf_path = None
+        app.pdf_figures = []
+        app.current_figure_idx = None
+        app.current_image = None
+        app.current_image_path = None
+        app.data_series = None
+        app.result_image = None
+        app.axis_config = None
+        app.ocr_results = None
+        app.raw_lines = None
+        app.cached_plot_area = None
+        app.selected_line_idx = None
+        app.edit_mode = None
+        app.add_anchors = []
+        app.x_axis_name = ""
+        app.y_axis_name = ""
+        app.x_axis_detected = ""
+        app.y_axis_detected = ""
+        app.kmds_record = None
+        app.merged_record = None
+        app.fig_digitizations = {}
+        app.fig_reviews = {}
+        app._vlm_labeled = set()
+        app._vlm_axes_read = set()
+
+        # Image / gallery UI
+        input_image.src = None
+        input_image.visible = False
+        result_image.src = None
+        result_image.visible = False
+        pdf_gallery_row.controls.clear()
+        pdf_gallery.visible = False
+        pdf_gallery_title.value = ""
+
+        # Paper info
+        paper_info_card.visible = False
+
+        # KMDS panel
+        kmds_panel.visible = False
+        kmds_fields_list.controls.clear()
+        kmds_summary_text.value = ""
+        kmds_paths["en"] = None
+        kmds_paths["ja"] = None
+        kmds_paths["dir"] = None
+        kmds_paths["current"] = None
+
+        # Axis fields / data table
+        info_text.value = ""
+        axis_info_text.value = ""
+        x_axis_name_field.value = ""
+        y_axis_name_field.value = ""
+        kmds_x_text.value = ""
+        kmds_y_text.value = ""
+
+        # Disable follow-on buttons (same gating as cold start)
+        kmds_btn.disabled = True
+        open_record_btn.disabled = True
+        review_figures_btn.disabled = True
+        recrop_btn.disabled = True
+        delete_fig_btn.disabled = True
+
+        process_status_text.value = "Cleared. Open a PDF or image to start."
+        page.update()
+
+    clear_btn.on_click = on_clear
+
+    _row_opts = dict(
+        alignment=ft.MainAxisAlignment.START,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        wrap=True, run_spacing=8, spacing=8,
+    )
+
+    # Persistent status bar — visible under the header regardless of scroll.
+    status_bar = _card(
+        ft.Row([process_progress_ring, process_status_text],
+               spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        pad=10,
+    )
+
+    # Step 1: just the open-document buttons.
+    step1_card = _card(
+        ft.Column([
+            _section_header(ft.Icons.FILE_OPEN, "Step 1 · Open document"),
+            ft.Row(
+                [ft.Row([open_pdf_btn, upload_btn, paste_btn], spacing=8),
+                 clear_btn],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            ft.Text("Drop support is pending the Flet upgrade — use Open PDF for now.",
+                    size=10, color=INK_3),
         ], spacing=8),
         pad=12)
 
@@ -4254,7 +4510,7 @@ def main(page: ft.Page):
                 ft.Text(hint, size=11, color=INK_3),
             ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                tight=True),
-            width=CANVAS_W, height=150, alignment=ft.alignment.center,
+            width=CANVAS_W, height=150, alignment=ft.Alignment.CENTER,
         )
 
     def _img_card(title, icon, body, ph_icon, ph_hint):
@@ -4265,29 +4521,66 @@ def main(page: ft.Page):
                        spacing=6),
                 ft.Container(content=ft.Stack([_img_placeholder(ph_icon, ph_hint), body]),
                              bgcolor=SURFACE_2, border_radius=10,
-                             border=ft.border.all(1, RULE), padding=4),
+                             border=ft.Border.all(1, RULE), padding=4),
             ], spacing=8, width=CANVAS_W + 8),
-            padding=10, bgcolor=SURFACE, border_radius=14, border=ft.border.all(1, RULE),
+            padding=10, bgcolor=SURFACE, border_radius=14, border=ft.Border.all(1, RULE),
             shadow=_card_shadow())
 
-    main_content = ft.Column([
-        toolbar_card,
-        pdf_gallery,
-        # Fixed-width image columns: the click-to-pixel math assumes the canvas
-        # renders at exactly CANVAS_W, so the columns must NOT be squeezed.
-        ft.Row([
-            _img_card("Input image", ft.icons.IMAGE_OUTLINED, input_image,
-                      ft.icons.ADD_PHOTO_ALTERNATE_OUTLINED,
+    # Step 2: analyze paper — KMDS buttons + figure detector + KMDS result below.
+    step2_card = _card(
+        ft.Column([
+            _section_header(ft.Icons.AUTO_AWESOME, "Step 2 · Analyze paper"),
+            ft.Row([kmds_btn, open_record_btn], **_row_opts),
+            ft.Row([pdf_detector_dropdown, review_figures_btn], **_row_opts),
+            # Results of this step:
+            paper_info_card,
+            kmds_panel,
+        ], spacing=8),
+        pad=12)
+
+    # Step 3: pick & crop figure — gallery + input image preview.
+    step3_card = _card(
+        ft.Column([
+            _section_header(ft.Icons.CROP, "Step 3 · Pick & crop figure"),
+            ft.Text("Pick a figure from the gallery below, then refine with Recrop.",
+                    size=11, color=INK_3),
+            ft.Row(
+                [recrop_btn, delete_fig_btn],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            # Results of this step:
+            pdf_gallery,
+            _img_card("Selected figure", ft.Icons.IMAGE_OUTLINED, input_image,
+                      ft.Icons.ADD_PHOTO_ALTERNATE_OUTLINED,
                       "Open an image or PDF to begin"),
-            _img_card("Extracted points", ft.icons.SHOW_CHART, result_stack,
-                      ft.icons.AUTO_GRAPH,
+        ], spacing=8),
+        pad=12)
+
+    # Step 4: review extraction + register — extraction preview + data table + upload.
+    step4_card = _card(
+        ft.Column([
+            _section_header(ft.Icons.CLOUD_UPLOAD, "Step 4 · Register to Starrydata"),
+            _img_card("Extracted points", ft.Icons.SHOW_CHART, result_stack,
+                      ft.Icons.AUTO_GRAPH,
                       "Detected lines will appear here"),
-        ], vertical_alignment=ft.CrossAxisAlignment.START,
-           scroll=ft.ScrollMode.AUTO, spacing=12),
-        info_text,
-        axis_info_text,
-        data_table_section,
-        kmds_panel,
+            info_text,
+            axis_info_text,
+            data_table_section,
+            ft.Row([axes_ok_check, extraction_ok_check, review_status], **_row_opts),
+            review_props,
+            ft.Row([save_fig_btn], **_row_opts),
+            ft.Row([sd2_upload_btn, sd2_url_field], **_row_opts),
+            ft.Row([sd3_upload_btn, sd3_url_field, sd3_key_field], **_row_opts),
+        ], spacing=8),
+        pad=12)
+
+    main_content = ft.Column([
+        status_bar,
+        step1_card,
+        step2_card,
+        step3_card,
+        step4_card,
     ], expand=True, scroll=ft.ScrollMode.AUTO, spacing=12)
 
     def _star(left, top, size, color, opacity):
@@ -4308,27 +4601,27 @@ def main(page: ft.Page):
 
     if _logo_b64:
         brand_mark = ft.Container(
-            content=ft.Image(src_base64=_logo_b64, width=38, height=38,
-                             fit=ft.ImageFit.COVER),
+            content=ft.Image(src=_logo_b64, width=38, height=38,
+                             fit=ft.BoxFit.COVER),
             width=38, height=38, border_radius=999, bgcolor="#FFFFFF",
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            border=ft.border.all(2, "#3A4C8F"),
+            border=ft.Border.all(2, "#3A4C8F"),
             shadow=ft.BoxShadow(blur_radius=12, color="#66060B22"),
         )
     else:
         brand_mark = ft.Container(
             content=ft.Text("✦", size=17, color="#FFFFFF", weight=ft.FontWeight.BOLD),
-            width=38, height=38, alignment=ft.alignment.center, border_radius=10,
-            gradient=ft.LinearGradient(begin=ft.alignment.top_left,
-                                       end=ft.alignment.bottom_right,
+            width=38, height=38, alignment=ft.Alignment.CENTER, border_radius=10,
+            gradient=ft.LinearGradient(begin=ft.Alignment.TOP_LEFT,
+                                       end=ft.Alignment.BOTTOM_RIGHT,
                                        colors=["#7CA1FF", "#3B6FE0"]),
             shadow=ft.BoxShadow(blur_radius=14, color="#553B6FE0"),
         )
 
     version_pill = ft.Container(
         content=ft.Text(f"v{APP_VERSION}", size=11, color="#AAB8E2"),
-        padding=ft.padding.symmetric(horizontal=10, vertical=4),
-        border_radius=999, bgcolor="#1D2A5C", border=ft.border.all(1, "#39498D"),
+        padding=ft.Padding.symmetric(horizontal=10, vertical=4),
+        border_radius=999, bgcolor="#1D2A5C", border=ft.Border.all(1, "#39498D"),
     )
 
     # Navy "night sky" band over the light workspace.
@@ -4352,18 +4645,18 @@ def main(page: ft.Page):
                 version_pill,
             ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=14),
         ]),
-        padding=ft.padding.symmetric(horizontal=22, vertical=14),
-        gradient=ft.LinearGradient(begin=ft.alignment.center_left,
-                                   end=ft.alignment.center_right,
+        padding=ft.Padding.symmetric(horizontal=22, vertical=14),
+        gradient=ft.LinearGradient(begin=ft.Alignment.CENTER_LEFT,
+                                   end=ft.Alignment.CENTER_RIGHT,
                                    colors=["#111C46", "#2E4489"]),
-        border=ft.border.only(bottom=ft.BorderSide(1, "#0D1534")),
+        border=ft.Border.only(bottom=ft.BorderSide(1, "#0D1534")),
     )
 
     body = ft.Container(
         content=ft.Row([settings_panel, main_content], expand=True, spacing=16),
         expand=True, padding=18,
-        gradient=ft.LinearGradient(begin=ft.alignment.top_center,
-                                   end=ft.alignment.bottom_center,
+        gradient=ft.LinearGradient(begin=ft.Alignment.TOP_CENTER,
+                                   end=ft.Alignment.BOTTOM_CENTER,
                                    colors=["#E7EEFC", PAPER]),
     )
 
@@ -4399,17 +4692,16 @@ def main(page: ft.Page):
 
                         def on_import_startup(_):
                             _model_import_context["mode"] = "startup"
-                            model_import_picker.pick_files(
+                            _pick_files_bridge(model_import_picker, import_model_result,
                                 allow_multiple=True, allowed_extensions=["pth"],
-                                dialog_title="Select model files (iter_3000.pth, checkpoint.pth)",
-                            )
+                                dialog_title="Select model files (iter_3000.pth, checkpoint.pth)")
 
                         download_help = ft.Column([
                             ft.Text("Auto-download failed.", color=ERR),
                             ft.Text("1. Download from:", no_wrap=False),
                             ft.TextButton("GitHub Releases", url=GITHUB_MODELS_URL),
                             ft.Text("2. Import models:", no_wrap=False),
-                            ft.FilledTonalButton("Import Models", icon=ft.icons.FILE_UPLOAD,
+                            ft.FilledTonalButton("Import Models", icon=ft.Icons.FILE_UPLOAD,
                                                  on_click=on_import_startup),
                             ft.Text("(select iter_3000.pth and checkpoint.pth)",
                                     size=11, no_wrap=False, color=INK_3),
@@ -4439,24 +4731,17 @@ def main(page: ft.Page):
             progress_ring.visible = False
             page.update()
 
-            axis_status_text.value = "Loading..."
-            page.update()
-
+            # ChartDete (axis OCR) is deferred to the first figure that needs
+            # it — the preload used to add ~2s + ~300 MB RSS before the user
+            # had done anything. See LineFormerApp.detect_axis_calibration for
+            # the lazy path.
             if not CHARTDETE_AVAILABLE:
                 app.auto_axis = False
                 axis_status_text.value = "Not available"
                 axis_status_text.color = WARN
             else:
-                try:
-                    app.load_chartdete_model()
-                    axis_status_text.value = "Axis model loaded."
-                    axis_status_text.color = OK
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    app.auto_axis = False
-                    axis_status_text.value = f"Failed: {e}"
-                    axis_status_text.color = ERR
+                axis_status_text.value = "Loads on first figure."
+                axis_status_text.color = INK_3
         except Exception as e:
             status_text.value = f"Failed: {e}"
             status_text.color = ERR
@@ -4474,4 +4759,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)

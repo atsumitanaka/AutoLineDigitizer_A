@@ -39,43 +39,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "setuptools<71" wheel pyyaml addict yapf
-          pip install pyinstaller "flet==0.24.1"
+          pip install pyinstaller "flet>=1.1.2" "flet-webview>=1.1.2"
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install numpy Pillow
           CC=clang CXX=clang++ CFLAGS='-stdlib=libc++' MMCV_WITH_OPS=1 pip install mmcv-full==1.7.2 --no-build-isolation
           pip install opencv-python-headless scipy scikit-image bresenham easyocr terminaltables matplotlib pycocotools
           pip install pymupdf anthropic huggingface_hub jsonschema "transformers>=4.43"
 
-      - name: Cache PP-DocLayoutV2 weights
-        uses: actions/cache@v4
-        with:
-          path: pp_doclayoutv2_weights
-          key: pp-doclayoutv2-weights-v1
-
-      - name: Download PP-DocLayoutV2 weights (MinerU figure detector)
-        run: |
-          if [ ! -f pp_doclayoutv2_weights/models/Layout/PP-DocLayoutV2/model.safetensors ]; then
-            python src/mineru_layout/download_weights.py pp_doclayoutv2_weights
-          fi
-          ls -la pp_doclayoutv2_weights/models/Layout/PP-DocLayoutV2/
-
-      - name: Download EasyOCR models
-        run: |
-          mkdir -p easyocr_models
-          curl -L -o easyocr_models/craft_mlt_25k.pth https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip
-          curl -L -o easyocr_models/english_g2.pth https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip
-          cd easyocr_models
-          python -c "
-          import zipfile, os
-          for f in ['craft_mlt_25k.pth', 'english_g2.pth']:
-              zf = f  # downloaded as .pth but is actually .zip
-              base = os.path.splitext(f)[0]
-              os.rename(f, base + '.zip')
-              with zipfile.ZipFile(base + '.zip', 'r') as z:
-                  z.extractall('.')
-              os.remove(base + '.zip')
-          "
-          ls -la
+      # Model weights are NOT bundled anymore (shaved ~300 MB off each build).
+      # EasyOCR + PP-DocLayoutV2 download on first use into the user data dir.
 
       - name: Embed version
         run: |
@@ -85,10 +57,16 @@ jobs:
       - name: Build macOS app
         run: pyinstaller AutoLineDigitizer.spec --noconfirm
 
+      - name: Deduplicate macOS bundle (Resources ↔ Frameworks symlinks)
+        # Skip this step for signed/notarized builds — code signatures do not
+        # survive the Resources→Frameworks symlinking.
+        if: env.SKIP_DEDUPE != '1'
+        run: python scripts/dedupe_macos_bundle.py dist/AutoLineDigitizer.app
+
       - name: Create ZIP archive
         run: |
           cd dist
-          zip -r AutoLineDigitizer-macOS.zip AutoLineDigitizer.app
+          zip -ry AutoLineDigitizer-macOS.zip AutoLineDigitizer.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -122,7 +100,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "setuptools<71" wheel pyyaml addict yapf
-          pip install pyinstaller "flet==0.24.1"
+          pip install pyinstaller "flet>=1.1.2" "flet-webview>=1.1.2"
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install numpy Pillow
           pip install mmcv-full==1.7.2 --no-build-isolation
@@ -131,28 +109,8 @@ jobs:
         env:
           MMCV_WITH_OPS: '1'
 
-      - name: Cache PP-DocLayoutV2 weights
-        uses: actions/cache@v4
-        with:
-          path: pp_doclayoutv2_weights
-          key: pp-doclayoutv2-weights-v1
-
-      - name: Download PP-DocLayoutV2 weights (MinerU figure detector)
-        run: |
-          if (-not (Test-Path "pp_doclayoutv2_weights/models/Layout/PP-DocLayoutV2/model.safetensors")) {
-            python src/mineru_layout/download_weights.py pp_doclayoutv2_weights
-          }
-          Get-ChildItem pp_doclayoutv2_weights/models/Layout/PP-DocLayoutV2/
-
-      - name: Download EasyOCR models
-        run: |
-          mkdir easyocr_models
-          Invoke-WebRequest -Uri "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip" -OutFile "easyocr_models\craft_mlt_25k.zip"
-          Invoke-WebRequest -Uri "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip" -OutFile "easyocr_models\english_g2.zip"
-          Expand-Archive -Path "easyocr_models\craft_mlt_25k.zip" -DestinationPath "easyocr_models" -Force
-          Expand-Archive -Path "easyocr_models\english_g2.zip" -DestinationPath "easyocr_models" -Force
-          Remove-Item "easyocr_models\*.zip"
-          Get-ChildItem easyocr_models
+      # Model weights are NOT bundled anymore. EasyOCR + PP-DocLayoutV2
+      # download on first use into the per-user data directory.
 
       - name: Embed version
         run: |

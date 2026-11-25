@@ -1,5 +1,8 @@
 # Desktop App (Flet)
-flet==0.24.1
+# Flet 1.x needed for macOS WebView support (flet-webview). 0.24 was mobile-only
+# for WebView and is what the pre-v0.9 .app shipped.
+flet>=1.1.2
+flet-webview>=1.1.2
 opencv-python>=4.8.0
 numpy>=1.24.0
 

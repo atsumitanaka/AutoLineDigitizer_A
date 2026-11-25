@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.environ.get(
-    "KMDS_SCHEMA", os.path.join(SCRIPT_DIR, "kmds_v15.2.4_nullable.json"))
+    "KMDS_SCHEMA", os.path.join(SCRIPT_DIR, "ncmrd_schema_tanaka.json"))
 
 _WRAPPER_KEYS = {"value", "unit", "uncertainty", "measurement"}
 

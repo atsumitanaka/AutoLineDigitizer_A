@@ -22,7 +22,8 @@ classifiers = [
 #   MMCV_WITH_OPS=1 pip install mmcv-full==1.7.2 --no-build-isolation
 # See `.github/workflows/release.yml` for the canonical install sequence.
 dependencies = [
-    "flet==0.24.1",
+    "flet>=1.1.2",
+    "flet-webview>=1.1.2",  # macOS WebView (wpd-auto embed), added in Flet 1.x
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
     "Pillow",

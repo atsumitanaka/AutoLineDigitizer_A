@@ -124,13 +124,43 @@ SUB_PROMPTS: Dict[str, str] = {
     # PHASE 1 — record core + id namespaces (samples s-NNN, materials material_NN)
     "core": (
         "## For THIS call only (PHASE 1 — record core and id namespaces)\n"
-        "Extract:\n"
+        "\n"
+        "### CRITICAL — how to fill `samples[].name` (read this FIRST)\n"
+        "`samples[].name` is the SHORT IDENTIFIER LABEL as literally printed in the "
+        "paper's figure legends, figure captions, table headers, or body text to "
+        "distinguish THIS sample from the others — NOT the chemical formula. The "
+        "chemical formula/composition belongs in `samples[].components[]` ONLY.\n"
+        "\n"
+        "Where to find the label, in priority order:\n"
+        "1. The legend box inside a figure (e.g. `x=0.05`, `x=0.1`, `S1`, `as-prepared`).\n"
+        "2. The figure caption (e.g. a caption listing `(x = 0.05, 0.10, 0.15, 0.20)` — "
+        "   each value is a separate sample label).\n"
+        "3. The body text / Methods / table header where the samples are introduced.\n"
+        "When captions/text use a parameter sweep like `Ti_{1-x}Ta_xCoSb (x = 0.05, "
+        "0.10, 0.15, 0.20)`, each x-value is one sample and the `name` of that sample "
+        "is `x=0.05`, `x=0.10`, `x=0.15`, `x=0.20` respectively (in order of appearance).\n"
+        "\n"
+        "Worked example (follow this pattern):\n"
+        "- Paper: 'Ti_{1-x}Ta_xCoSb alloys with x = 0.05, 0.10, 0.15, 0.20 were "
+        "prepared… Fig. 3 shows σ(T) for x=0.05, x=0.10, x=0.15, x=0.20.'\n"
+        "- WRONG: `{\"sample local id\": \"s-001\", \"name\": \"Ti0.95Ta0.05CoSb\", "
+        "\"components\": [{\"name\": \"Ti0.95Ta0.05CoSb\"}]}` ← formula duplicated into "
+        "name.\n"
+        "- RIGHT: `{\"sample local id\": \"s-001\", \"name\": \"x=0.05\", "
+        "\"components\": [{\"name\": \"Ti0.95Ta0.05CoSb\"}]}` ← short legend label in "
+        "name, formula only in components.\n"
+        "- Only when the paper truly uses the formula itself as the per-sample label "
+        "(no parameter notation, no shorthand like S1/BT-fine) may `name` be the "
+        "formula — otherwise prefer the shorthand.\n"
+        "\n"
+        "### Extract:\n"
         "1. `metadata` — all six required fields plus `rights`, and `metadata.publication` "
         "with the bibliography (DOI, title, authors[] with roles/affiliations, journal, "
         "year, dates, volume/issue/pages, `abstract` copied from the printed abstract, "
         "type, open access status, and `references` = the DOIs printed in the reference "
         "list — skip entries without a printed DOI), `scope` (paradigms, purposes, "
-        "approaches, conclusions[], classifications, comments), and `samples[]`.\n"
+        "approaches, conclusions[], classifications, comments), and `samples[]` (fill "
+        "`name` per the rule above).\n"
         "2. Top-level `system` (null unless a `name` enum member genuinely applies).\n"
         "3. Top-level `materials` — a NAMESPACE ONLY: one `{id, name}` entry per distinct "
         "material system/composition originally studied in this paper, ids `material_01`, "
@@ -138,10 +168,10 @@ SUB_PROMPTS: Dict[str, str] = {
         "information/structure/process/property here — later calls do that.\n"
         "\n"
         "Cross-linking rules (the heart of this schema — do not skip):\n"
-        "- `samples[].components[]`: for every component that corresponds to a "
-        "`materials[]` entry, add `{\"scheme\": \"KMDS material\", \"id\": "
-        "\"material_NN\"}` to its `references`; fill `role` and `fraction value`/"
-        "`fraction unit` when the paper states them.\n"
+        "- `samples[].components[]`: carries the resolved chemical composition. For "
+        "every component that corresponds to a `materials[]` entry, add `{\"scheme\": "
+        "\"KMDS material\", \"id\": \"material_NN\"}` to its `references`; fill "
+        "`role` and `fraction value`/`fraction unit` when the paper states them.\n"
         "- `scope.conclusions[]`: each entry is `{text, samples}` — list the `sample "
         "local id`s the conclusion concerns.\n"
         "Do NOT output figures/graphs/tables/`text passages` keys — a separate call "
@@ -458,6 +488,101 @@ def repair_record(record: Dict[str, Any], schema: Dict[str, Any],
                         changed = True
         if not changed:
             break
+    return log
+
+
+# Matches a sequence like "x = 0.05, 0.10, 0.15, 0.20" (two or more numeric
+# values after `x =`, separated by ASCII or Japanese full-width commas).
+_X_SWEEP_RE = re.compile(r"x\s*=\s*([\d.]+(?:\s*[,、]\s*[\d.]+)+)",
+                         re.IGNORECASE)
+
+
+def _parse_x_sweep(text: str) -> List[str]:
+    """Pull the first `x = a, b, c[, d...]` series out of a graph description.
+    Returns a list of normalized x-value strings (trailing periods stripped,
+    'x=0.05' prefix added for use as a sample name)."""
+    if not text:
+        return []
+    m = _X_SWEEP_RE.search(text)
+    if not m:
+        return []
+    # Split on either comma variety so translated (JA) descriptions work too.
+    raw = re.split(r"[,、]", m.group(1))
+    vals = [v.strip().rstrip(".") for v in raw]
+    return [v for v in vals if v]
+
+
+def _looks_like_formula_duplicate(sample: Dict[str, Any]) -> bool:
+    """True if sample.name is identical to any component.name — the exact
+    LLM slip-up this pass exists to repair."""
+    nm = (sample.get("name") or "").strip()
+    if not nm:
+        return False
+    for c in (sample.get("components") or []):
+        if isinstance(c, dict) and (c.get("name") or "").strip() == nm:
+            return True
+    return False
+
+
+def relabel_samples_from_graphs(record: Dict[str, Any]) -> List[str]:
+    """Deterministic post-pass: when `samples[].name` was filled with a
+    chemical formula identical to the sample's component (an LLM slip-up the
+    prompt cannot reliably prevent), substitute the legend label from the
+    data_sources figures — e.g. 'Ti0.95Ta0.05CoSb' -> 'x=0.05'.
+
+    Mapping is drawn from `metadata.publication.figures[].graphs[]` where the
+    graph's `description` contains an `x = a, b, c, d` sweep and its `samples`
+    list has the same count. Literature-only reference values (leading `x = 0`
+    when the graph has one more value than samples) are dropped. A sample is
+    renamed only when every usable graph agrees on its label.
+    """
+    log: List[str] = []
+    pub = (record.get("metadata") or {}).get("publication") or {}
+    samples = pub.get("samples") or []
+    if not samples:
+        return log
+
+    # Collect per-sample label candidates by scanning every graph that
+    # references this sample.
+    candidates: Dict[str, List[str]] = {}  # sample_local_id -> [label, ...]
+    for fig in (pub.get("figures") or []):
+        for g in (fig.get("graphs") or []):
+            sids = [s for s in (g.get("samples") or []) if isinstance(s, str)]
+            if not sids:
+                continue
+            xs = _parse_x_sweep(g.get("description") or "")
+            if not xs:
+                continue
+            # The literature `x = 0` reference is common and doesn't have a
+            # sample row in this paper; drop it if that reconciles the lengths.
+            if len(xs) == len(sids) + 1 and xs[0] in ("0", "0.0"):
+                xs = xs[1:]
+            if len(xs) != len(sids):
+                continue
+            for sid, xv in zip(sids, xs):
+                candidates.setdefault(sid, []).append(f"x={xv}")
+
+    if not candidates:
+        return log
+
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("sample local id")
+        if not sid or not _looks_like_formula_duplicate(s):
+            continue
+        cands = candidates.get(sid) or []
+        if not cands:
+            continue
+        # Only rename when every graph agrees — avoids flipping on noisy data.
+        uniq = set(cands)
+        if len(uniq) != 1:
+            log.append(f"[{sid}] conflicting legend labels {sorted(uniq)} — left unchanged")
+            continue
+        new_name = next(iter(uniq))
+        old = s.get("name")
+        s["name"] = new_name
+        log.append(f"[{sid}] name: {old!r} -> {new_name!r}  (from graph legends)")
     return log
 
 
@@ -986,7 +1111,7 @@ async def extract_kmds_parallel(pdf_path: str, output_dir: str,
     # model conforms to actual field names / types / enums (not a skeleton).
     if schema_path is None:
         here = os.path.dirname(os.path.abspath(__file__))
-        schema_path = os.path.join(here, "kmds_v15.2.4_nullable.json")
+        schema_path = os.path.join(here, "ncmrd_schema_tanaka.json")
     full_schema = None
     section_schemas: Dict[str, Any] = {}
     try:
@@ -1100,6 +1225,11 @@ async def extract_kmds_parallel(pdf_path: str, output_dir: str,
             n_refs = fill_axis_refs(merged, full_schema)
             if n_refs:
                 print(f"   ✓ filled {n_refs} axes quantity.ref from schema vocabulary")
+        relabel_log = relabel_samples_from_graphs(merged)
+        if relabel_log:
+            repair_log.extend(relabel_log)
+            print(f"   ✓ sample relabel: {len(relabel_log)} name(s) swapped "
+                  f"formula -> legend label")
 
         en_path = os.path.join(output_dir, f"{base_name}.json")
         with open(en_path, "w", encoding="utf-8") as f:

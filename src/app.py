@@ -19,9 +19,20 @@ sys.path.insert(0, os.path.join(_project_root, 'submodules', 'chartdete'))
 # Add lineformer submodule to path
 sys.path.insert(0, os.path.join(_project_root, 'submodules', 'lineformer'))
 
-# Import mmdet (uses ChartDete's mmdet which includes custom models like CascadeRoIHead_LGF)
-import mmdet  # noqa: F401
-from mmdet.models.roi_heads.cascade_roi_head_LGF import CascadeRoIHead_LGF  # noqa: F401
+# Import mmdet (uses ChartDete's mmdet which includes custom models like
+# CascadeRoIHead_LGF). Wrapped in try/except so the app still boots on
+# machines without torch+mmcv-full (e.g. starryai: no GPU, Streamlit-only
+# deploy). LineFormer / ChartDete / Scatter tabs then short-circuit via
+# _load_models() returning (None, None) and warn the user instead of
+# crashing on boot. The "📄 Paper → wpd-auto" tab does not need mmdet.
+try:
+    import mmdet  # noqa: F401
+    from mmdet.models.roi_heads.cascade_roi_head_LGF import CascadeRoIHead_LGF  # noqa: F401
+    _MMDET_AVAILABLE = True
+    _MMDET_ERROR = None
+except Exception as _mmdet_e:  # noqa: BLE001
+    _MMDET_AVAILABLE = False
+    _MMDET_ERROR = str(_mmdet_e)
 
 # Add src to path for local imports
 sys.path.insert(0, _src_dir)
@@ -184,24 +195,46 @@ def sort_data_series(data_series, sort_mode):
     return data_series
 
 
-def extract_lines(infer_module, img, downsample_mode, fixed_step, max_points):
-    """Extract line data from image."""
-    line_dataseries = infer_module.get_dataseries(img, to_clean=False)
+def extract_lines(infer_module, img, downsample_mode, fixed_step, max_points,
+                  mask_extend_px=0):
+    """Extract line data from image.
+
+    mask_extend_px: horizontally dilate each line mask by this many pixels
+      before extracting the centerline. LineFormer masks often stop a few
+      pixels short of a curve's true endpoints, which after axis calibration
+      shows up as "the first data point is at X=305 instead of 300". A small
+      horizontal dilation (~3–10 px) recovers those edge pixels without
+      merging separate lines vertically.
+    """
+    # return_masks=True lets us bypass the fixed centerline extraction inside
+    # LineFormer and apply optional mask dilation before recomputing it.
+    _, inst_masks = infer_module.get_dataseries(
+        img, to_clean=False, return_masks=True,
+    )
 
     data_series = []
-    for line in line_dataseries:
-        if len(line) == 0:
+    for line_mask in inst_masks:
+        if line_mask is None:
             continue
-
-        # Extract all points
-        all_points = [[int(pt['x']), int(pt['y'])] for pt in line]
-
-        # Downsample
-        points = downsample_points(all_points, downsample_mode, fixed_step, max_points)
-
+        if mask_extend_px > 0:
+            # Horizontal-only kernel: expands the mask left/right by
+            # `mask_extend_px` on each side without bleeding vertically.
+            kernel = np.ones((1, 2 * int(mask_extend_px) + 1), np.uint8)
+            line_mask = cv2.dilate(line_mask.astype(np.uint8), kernel)
+        ys, xs = np.nonzero(line_mask)
+        if len(xs) == 0:
+            continue
+        x_to_ys = {}
+        for x, y in zip(xs, ys):
+            x_to_ys.setdefault(int(x), []).append(int(y))
+        sorted_xs = sorted(x_to_ys.keys())
+        all_points = [[x, int(np.median(x_to_ys[x]))] for x in sorted_xs]
+        points = downsample_points(
+            all_points, downsample_mode, fixed_step, max_points,
+        )
         data_series.append({"points": points})
 
-    return data_series, line_dataseries
+    return data_series, inst_masks
 
 
 def _pixel_to_data(px, py, axis_config):
@@ -232,6 +265,53 @@ def _data_to_pixel(x, y, axis_config):
     px = x1p + (float(x) - x1v) * (x2p - x1p) / dx_v
     py = y1p + (float(y) - y1v) * (y2p - y1p) / dy_v
     return px, py
+
+
+def resample_curves_by_x_grid(data_series, axis_config, x_step):
+    """Replace each curve's points with values on a fixed X-data-space grid.
+
+    Grid X values are aligned to multiples of `x_step` (e.g. 250, 300, 350 …
+    for step=50), clipped to the curve's own X range, and Y values are
+    linearly interpolated. Output points are converted back to pixel coords
+    so the rest of the pipeline (display, XY table, StarryDigitizer export)
+    keeps working unchanged.
+    """
+    if not axis_config or x_step <= 0:
+        return data_series
+    out = []
+    for s in data_series:
+        pts_px = s.get("points") or []
+        if len(pts_px) < 2:
+            out.append(s)
+            continue
+        # Curve in data space, sorted by X.
+        pts_data = [_pixel_to_data(px, py, axis_config) for px, py in pts_px]
+        pts_data.sort(key=lambda p: p[0])
+        xs = np.array([p[0] for p in pts_data], dtype=float)
+        ys = np.array([p[1] for p in pts_data], dtype=float)
+        # Grid: first multiple of x_step ≥ min(xs), last multiple ≤ max(xs).
+        # The -1e-9 / +1e-9 guards float noise so 300.0000001 ceils to 300
+        # (not 350) and 399.9999999 floors to 400 (not 350).
+        x_min_grid = np.ceil(xs.min() / x_step - 1e-9) * x_step
+        x_max_grid = np.floor(xs.max() / x_step + 1e-9) * x_step
+        if x_max_grid < x_min_grid:
+            out.append(s)
+            continue
+        n = int(round((x_max_grid - x_min_grid) / x_step)) + 1
+        xg = np.linspace(x_min_grid, x_max_grid, n)
+        yg = np.interp(xg, xs, ys)
+        # Store fractional pixel coords so the XY table (which does
+        # pixel → data via _pixel_to_data) recovers the exact grid X
+        # values instead of 298.9 / 349.7 after integer rounding.
+        # draw_points_on_image casts to int on its own for cv2.drawMarker.
+        new_points = []
+        for xi, yi in zip(xg, yg):
+            px, py = _data_to_pixel(float(xi), float(yi), axis_config)
+            new_points.append([float(px), float(py)])
+        new_s = dict(s)
+        new_s["points"] = new_points
+        out.append(new_s)
+    return out
 
 
 def draw_points_on_image(img, data_series, axis_config=None,
@@ -709,6 +789,10 @@ def _render_sidebar():
     else:
         fixed_step, max_points = 10, 50
 
+    # Extend-mask / X-grid step are per-image controls, rendered inline in
+    # the Curves section (near the Resample button) so their effect on
+    # extraction and resampling is visible right next to the action.
+
     return dict(
         show_visualization=show_visualization,
         auto_axis=auto_axis,
@@ -800,7 +884,21 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         return
 
     H, W = img.shape[:2]
-    pts = edited_series[selected_idx]["points"]
+    pts_saved = edited_series[selected_idx]["points"]
+    pending_key = f"vis_pending_{img_key}_{selected_idx}"
+    ver_key = f"vis_ver_{img_key}_{selected_idx}"
+    stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
+
+    # Pending edits live in session_state as an authoritative list, so mode
+    # switches (which re-mount the canvas) preserve them. `pts` is what the
+    # canvas / view mode actually displays: pending if any, else last-saved.
+    pending_state = st.session_state.get(pending_key)
+    pts = ([list(p) for p in pending_state] if pending_state is not None
+           else [list(p) for p in pts_saved])
+    has_pending = (pending_state is not None
+                   and [list(p) for p in pending_state] !=
+                       [list(p) for p in pts_saved])
+
     # BGR palette -> RGB tuple -> css.
     r, g, b = palette[selected_idx % len(palette)][::-1]
     line_css = f"rgb({r},{g},{b})"
@@ -824,13 +922,14 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
                          key=f"visr_{img_key}_{selected_idx}")
     with undo_col:
         st.write("")
-        stack_key = f"vis_undo_stack_{img_key}_{selected_idx}"
         if st.button("↩︎ Undo",
                      key=f"vis_undo_{img_key}_{selected_idx}",
                      disabled=not st.session_state.get(stack_key)):
             if st.session_state.get(stack_key):
                 prev = st.session_state[stack_key].pop()
                 st.session_state[ss_key][selected_idx]["points"] = prev
+                st.session_state.pop(pending_key, None)
+                st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
                 st.rerun()
 
     # Fit canvas to viewport width while preserving image aspect.
@@ -849,6 +948,57 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     is_add = mode.startswith("➕")
     is_delete = mode.startswith("❌")
 
+    def _render_save_discard():
+        """Save commits pending → ss_key; Discard drops pending and re-mounts.
+
+        Re-reads session_state so the button state / badge reflect any
+        pending mutations that happened *after* the outer scope captured
+        `pending_state` — i.e. within this same rerun.
+        """
+        ps = st.session_state.get(pending_key)
+        hp = (ps is not None
+              and [list(p) for p in ps] != [list(p) for p in pts_saved])
+
+        if hp:
+            delta = len(ps) - len(pts_saved)
+            if delta > 0:
+                st.info(f"⏳ Pending: **+{delta}** point(s).")
+            elif delta < 0:
+                st.info(f"⏳ Pending: **{delta}** point(s).")
+            else:
+                st.info("⏳ Pending: point positions changed.")
+
+        sc, dc, _ = st.columns([1, 1, 3])
+        with sc:
+            if st.button("💾 Save",
+                         key=f"vis_save_{img_key}_{selected_idx}",
+                         disabled=not hp,
+                         type="primary"):
+                st.session_state.setdefault(stack_key, [])
+                st.session_state[stack_key].append(copy.deepcopy(pts_saved))
+                if len(st.session_state[stack_key]) > 20:
+                    st.session_state[stack_key] = \
+                        st.session_state[stack_key][-20:]
+                st.session_state[ss_key][selected_idx]["points"] = ps
+                st.session_state.pop(pending_key, None)
+                rev_key = f"rev_{img_key}"
+                st.session_state[rev_key] = (
+                    st.session_state.get(rev_key, 0) + 1
+                )
+                st.session_state[ver_key] = (
+                    st.session_state.get(ver_key, 0) + 1
+                )
+                st.rerun()
+        with dc:
+            if st.button("↩︎ Discard",
+                         key=f"vis_discard_{img_key}_{selected_idx}",
+                         disabled=not hp):
+                st.session_state.pop(pending_key, None)
+                st.session_state[ver_key] = (
+                    st.session_state.get(ver_key, 0) + 1
+                )
+                st.rerun()
+
     # ---- View mode: render a static image with points drawn on it. No
     # canvas at all so nothing can be accidentally dragged. ----
     if is_view:
@@ -859,6 +1009,7 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
             cv2.circle(static, (int(px), int(py)), r_pt, (0, 0, 0), 1)
         st.image(cv2.cvtColor(static, cv2.COLOR_BGR2RGB),
                  use_container_width=True)
+        _render_save_discard()
         return
 
     # Pre-populate the canvas with the current points as fabric.js circles.
@@ -912,10 +1063,41 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
     # The flicker that motivated False before was caused by our own
     # unconditional st.rerun() — with the auto-save-without-rerun path
     # below, drags now stick without a full re-mount.
-    canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode[:2]}"
+    # ver bumps on any canvas-detected change and on Save/Discard, so the
+    # canvas re-mounts with the fresh initial_drawing (pending or saved) and
+    # fabric.js drops its stale click-cursor circles. Add/Delete share the
+    # same drawing_mode ("point"), so switching between them keeps the same
+    # canvas key — that lets the *client-side* pending clicks accumulate
+    # visually. Only the Move ↔ non-Move transition needs a re-mount because
+    # drawing_mode changes; pending is preserved via initial_drawing.
+    ver = st.session_state.get(ver_key, 0)
+    # Per-mode tag forces a re-mount on Add↔Delete↔Move switches so cursors
+    # from the previous mode don't leak into the next mode's compute.
+    mode_tag = mode[:2]
+    canvas_key = f"vis_canvas_{img_key}_{selected_idx}_{mode_tag}_v{ver}"
+
+    # Remember which point list the canvas was mounted with. Within one
+    # mount (no key change), the canvas retains its objects and appends new
+    # cursors on each click, so pending must be recomputed against the
+    # *base* — not against the (already-updated) session_state pending, or
+    # the offset math treats prior clicks as new ones and cascades.
+    base_key = f"vis_base_{img_key}_{selected_idx}"
+    last_key_key = f"vis_last_key_{img_key}_{selected_idx}"
+    if st.session_state.get(last_key_key) != canvas_key:
+        st.session_state[base_key] = [list(p) for p in pts]
+        st.session_state[last_key_key] = canvas_key
+    canvas_base = st.session_state.get(base_key, [list(p) for p in pts])
+    # Delete cursors get a red fill so users can tell them apart from Add
+    # markers — otherwise both modes drop identical dots in the curve color.
+    if is_delete:
+        cursor_fill = "rgba(220,0,0,0.55)"
+        cursor_stroke = "rgba(140,0,0,1)"
+    else:
+        cursor_fill = line_css
+        cursor_stroke = line_css
     result = st_canvas(
-        fill_color=line_css,
-        stroke_color=line_css,
+        fill_color=cursor_fill,
+        stroke_color=cursor_stroke,
         stroke_width=1,
         background_image=pil_bg,
         update_streamlit=True,
@@ -928,11 +1110,20 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
         key=canvas_key,
     )
 
-    if is_move:
-        st.caption("🖐 Drag any point to reposition it. Changes commit "
-                   "automatically after each drag and reach the XY table below.")
+    if is_add:
+        st.caption("➕ Click empty space to add points. "
+                   "Press **💾 Save** when done.")
+    elif is_delete:
+        st.caption("❌ Click near a point to mark it for removal — a red "
+                   "dot appears where you clicked. Press **💾 Save** to "
+                   "commit the deletions.")
+    elif is_move:
+        st.caption("🖐 Drag any point to reposition it. "
+                   "Press **💾 Save** when done.")
+    st.caption("Mode switches keep pending edits. Curve switch discards them.")
 
     if not result or not result.json_data:
+        _render_save_discard()
         return
     objects = result.json_data.get("objects", []) or []
 
@@ -958,67 +1149,57 @@ def _render_visual_editor(img, edited_series, axis_config, selected_idx,
             px, py = to_image(cx, cy)
             canvas_pts.append([px, py])
 
-    def push_undo():
-        st.session_state.setdefault(stack_key, [])
-        st.session_state[stack_key].append(copy.deepcopy(pts))
-        if len(st.session_state[stack_key]) > 20:
-            st.session_state[stack_key] = st.session_state[stack_key][-20:]
-
-    changed = False
-    new_pts = None
-
-    if mode.startswith("➕"):
-        # Every extra circle beyond the initial set is a newly-added point.
-        if len(canvas_pts) > len(pts):
-            new_ones = canvas_pts[len(pts):]
-            merged = list(pts) + [[int(round(p[0])), int(round(p[1]))]
-                                  for p in new_ones]
+    # Recompute pending from (canvas_base + all accumulated cursors) — never
+    # from `pts` (which reflects prior pending and would double-count). This
+    # keeps within-mode clicks correct without re-mounting the canvas.
+    new_pending = None
+    if is_add:
+        if len(canvas_pts) > len(canvas_base):
+            new_ones = canvas_pts[len(canvas_base):]
+            merged = list(canvas_base) + [
+                [int(round(p[0])), int(round(p[1]))] for p in new_ones
+            ]
             merged.sort(key=lambda p: p[0])
-            new_pts = merged
-            changed = True
-    elif mode.startswith("❌"):
-        # New circles are "delete cursors": for each new click, drop the
-        # nearest existing point.
-        if len(canvas_pts) > len(pts) and pts:
-            new_ones = canvas_pts[len(pts):]
-            surviving = [list(p) for p in pts]
+            new_pending = merged
+    elif is_delete:
+        if len(canvas_pts) > len(canvas_base) and canvas_base:
+            new_ones = canvas_pts[len(canvas_base):]
+            surviving = [list(p) for p in canvas_base]
             for click in new_ones:
                 if not surviving:
                     break
                 arr = np.array(surviving, dtype=float)
                 d2 = (arr[:, 0] - click[0]) ** 2 + (arr[:, 1] - click[1]) ** 2
-                idx = int(np.argmin(d2))
-                del surviving[idx]
-            new_pts = [[int(round(p[0])), int(round(p[1]))] for p in surviving]
-            changed = True
+                idx_del = int(np.argmin(d2))
+                del surviving[idx_del]
+            new_pending = [[int(round(p[0])), int(round(p[1]))]
+                           for p in surviving]
     elif is_move:
-        # Every drag release triggers a Streamlit rerun (update_streamlit=True);
-        # if the returned canvas positions differ from what session_state
-        # remembers, commit them. No st.rerun() call — Streamlit already
-        # re-rendered from the canvas event, so mutating session_state now is
-        # enough for the XY table below to see the new points on this render.
-        if len(canvas_pts) == len(pts):
+        if len(canvas_pts) == len(canvas_base):
             moved = [[int(round(p[0])), int(round(p[1]))] for p in canvas_pts]
             moved.sort(key=lambda p: p[0])
-            if moved != [list(x) for x in pts]:
-                new_pts = moved
-                changed = True
+            if moved != [list(x) for x in canvas_base]:
+                new_pending = moved
 
-    if changed and new_pts is not None:
-        push_undo()
-        st.session_state[ss_key][selected_idx]["points"] = new_pts
-        # Bump the rev so the data_editor below re-instantiates and picks up
-        # the new points instead of its cached deltas.
-        rev_key = f"rev_{img_key}"
-        st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
-        # For Add/Delete we still st.rerun() so the canvas re-mounts with the
-        # updated object count. For Move the count is stable, and rerunning
-        # would tear down the fabric.js state mid-interaction.
-        if not is_move:
-            st.rerun()
+    if new_pending is not None and new_pending != [list(p) for p in pts_saved]:
+        # Silent update — no ver bump, no explicit st.rerun(). The canvas
+        # event already triggered a rerun, so on this same rerun the Save
+        # button and pending badge (which re-read session_state) reflect
+        # the new count without a canvas re-mount.
+        st.session_state[pending_key] = new_pending
+    elif (new_pending is not None
+          and new_pending == [list(p) for p in pts_saved]
+          and pending_state is not None):
+        # User canceled all pending edits (e.g. added then deleted the same
+        # point). Drop pending so has_pending goes false.
+        st.session_state.pop(pending_key, None)
+
+    _render_save_discard()
 
 
-def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_results):
+def _render_axis_picker(img, axis_config, ax_key, img_key, detections,
+                        ocr_results, W_img=None, H_img=None,
+                        rev_key=None, rev=0, chartdete_module=None):
     """Visual calibration picker: drag the four X1/X2/Y1/Y2 markers on the
     input image to their true tick positions, then click Save.
 
@@ -1034,7 +1215,11 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
         return
 
     H, W = img.shape[:2]
-    canvas_h = 460
+    # Canvas + controls sit side-by-side (LEFT: chart / RIGHT: value inputs).
+    # 50/50 split matches the "Input Image | Extraction Result" row above,
+    # so the "Drag markers" heading and the "Data values" heading (and the
+    # Extraction Result panel) all share the same vertical dividing line.
+    canvas_h = 380
     canvas_w = int(round(canvas_h * W / H))
     scale = canvas_h / H
 
@@ -1043,6 +1228,8 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
 
     def to_image(cx, cy):
         return cx / scale, cy / scale
+
+    canvas_col, ctrl_col = st.columns(2)
 
     # Order in initial_objects is preserved by fabric.js — we rely on that to
     # map indices back to X1, X2, Y1, Y2.
@@ -1082,95 +1269,93 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
     pil_bg = st.session_state[bg_cache_key]
 
     canvas_key = f"axis_pick_{img_key}"
-    try:
-        result = st_canvas(
-            fill_color="#e74c3c",
-            stroke_color="#000000",
-            stroke_width=2,
-            background_image=pil_bg,
-            update_streamlit=True,
-            height=canvas_h, width=canvas_w,
-            drawing_mode="transform",
-            initial_drawing={"version": "4.4.0", "objects": initial_objects},
-            display_toolbar=False,
-            key=canvas_key,
+    with canvas_col:
+        st.markdown("### 🎯 Drag calibration markers on chart")
+        st.caption(
+            "Drag each dot to the tick it represents, then enter the "
+            "corresponding value on the right and press **Save**."
         )
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Canvas failed to render: {e}")
-        result = None
+        try:
+            result = st_canvas(
+                fill_color="#e74c3c",
+                stroke_color="#000000",
+                stroke_width=2,
+                background_image=pil_bg,
+                update_streamlit=True,
+                height=canvas_h, width=canvas_w,
+                drawing_mode="transform",
+                initial_drawing={"version": "4.4.0", "objects": initial_objects},
+                display_toolbar=False,
+                key=canvas_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Canvas failed to render: {e}")
+            result = None
 
-    st.caption(
-        "Red = X-axis calibration points (drag to the left tick then the "
-        "right tick). Blue = Y-axis calibration points (drag to the bottom "
-        "tick then the top tick). "
-        "Enter the DATA VALUE each dragged marker represents, then Save."
-    )
-
-    # ---- Live position readout ----
-    # After each drag, the canvas reports new object positions on the next
-    # Streamlit rerun. Show them here so users can see where each marker
-    # actually is (pixel coords + provisional data-space using existing
-    # calibration) without having to guess.
-    if result and result.json_data:
-        objs = result.json_data.get("objects", []) or []
-        if len(objs) >= 4:
-            cur_positions = []
-            for i in range(4):
-                obj = objs[i]
-                left = float(obj.get("left", 0))
-                top = float(obj.get("top", 0))
-                ox = obj.get("originX", "left")
-                oy = obj.get("originY", "top")
-                radius = float(obj.get("radius", 0))
-                cx = left if ox == "center" else (left + radius)
-                cy = top if oy == "center" else (top + radius)
-                ix, iy = to_image(cx, cy)
-                data_x, data_y = _pixel_to_data(ix, iy, axis_config)
-                cur_positions.append((ix, iy, data_x, data_y))
-            _label = ["🔴 X1", "🔴 X2", "🔵 Y1", "🔵 Y2"]
-            with st.expander("Current marker positions (updates as you drag)",
-                             expanded=False):
-                for i, (ix, iy, dx, dy) in enumerate(cur_positions):
-                    st.write(
-                        f"{_label[i]}: pixel `({ix:.0f}, {iy:.0f})` — "
-                        f"current calibration says this pixel is "
-                        f"X≈`{dx:.3g}`, Y≈`{dy:.3g}`"
-                    )
-                st.caption(
-                    "Use these as a reference for what value to type below "
-                    "(e.g. drag the Y2 dot to the 250 tick, then type 250)."
-                )
-
-    # Value inputs for the 4 markers — pre-filled with current calibration.
-    st.markdown("**Data values at each dragged marker (type manually):**")
-    vc1, vc2 = st.columns(2)
-    with vc1:
-        v_x1 = st.number_input(
-            "🔴 X1 value (left tick on X axis)",
-            value=float(axis_config["x1_val"]),
-            key=f"axpick_x1v_{img_key}", format="%.6g",
-        )
-        v_x2 = st.number_input(
-            "🔴 X2 value (right tick on X axis)",
-            value=float(axis_config["x2_val"]),
-            key=f"axpick_x2v_{img_key}", format="%.6g",
-        )
-    with vc2:
-        v_y1 = st.number_input(
-            "🔵 Y1 value (bottom tick on Y axis)",
-            value=float(axis_config["y1_val"]),
-            key=f"axpick_y1v_{img_key}", format="%.6g",
-        )
-        v_y2 = st.number_input(
-            "🔵 Y2 value (top tick on Y axis)",
-            value=float(axis_config["y2_val"]),
-            key=f"axpick_y2v_{img_key}", format="%.6g",
+        st.caption(
+            "🔴 Red = X-axis (drag to left tick, then right tick). "
+            "🔵 Blue = Y-axis (drag to bottom tick, then top tick)."
         )
 
-    save_col, _ = st.columns([1, 4])
-    with save_col:
+    with ctrl_col:
+        st.markdown("**Data values at each marker:**")
+        # 2x2 grid: X row on top (X1 | X2), Y row on bottom (Y1 | Y2).
+        vr1_c1, vr1_c2 = st.columns(2)
+        with vr1_c1:
+            v_x1 = st.number_input(
+                "🔴 X1 value (left tick)",
+                value=float(axis_config["x1_val"]),
+                key=f"axpick_x1v_{img_key}", format="%.6g",
+            )
+        with vr1_c2:
+            v_x2 = st.number_input(
+                "🔴 X2 value (right tick)",
+                value=float(axis_config["x2_val"]),
+                key=f"axpick_x2v_{img_key}", format="%.6g",
+            )
+        vr2_c1, vr2_c2 = st.columns(2)
+        with vr2_c1:
+            v_y1 = st.number_input(
+                "🔵 Y1 value (bottom tick)",
+                value=float(axis_config["y1_val"]),
+                key=f"axpick_y1v_{img_key}", format="%.6g",
+            )
+        with vr2_c2:
+            v_y2 = st.number_input(
+                "🔵 Y2 value (top tick)",
+                value=float(axis_config["y2_val"]),
+                key=f"axpick_y2v_{img_key}", format="%.6g",
+            )
+
+        # Live position readout (compact) — collapsed by default because
+        # values above are usually enough.
+        if result and result.json_data:
+            objs = result.json_data.get("objects", []) or []
+            if len(objs) >= 4:
+                cur_positions = []
+                for i in range(4):
+                    obj = objs[i]
+                    left = float(obj.get("left", 0))
+                    top = float(obj.get("top", 0))
+                    ox = obj.get("originX", "left")
+                    oy = obj.get("originY", "top")
+                    radius = float(obj.get("radius", 0))
+                    cx = left if ox == "center" else (left + radius)
+                    cy = top if oy == "center" else (top + radius)
+                    ix, iy = to_image(cx, cy)
+                    data_x, data_y = _pixel_to_data(ix, iy, axis_config)
+                    cur_positions.append((ix, iy, data_x, data_y))
+                _label = ["🔴 X1", "🔴 X2", "🔵 Y1", "🔵 Y2"]
+                with st.expander("Current marker positions", expanded=False):
+                    for i, (ix, iy, dx, dy) in enumerate(cur_positions):
+                        st.caption(
+                            f"{_label[i]}: px `({ix:.0f}, {iy:.0f})` → "
+                            f"X≈`{dx:.3g}`, Y≈`{dy:.3g}`"
+                        )
+
         if st.button("💾 Save positions + values",
-                     key=f"axpick_save_{img_key}", type="primary"):
+                     key=f"axpick_save_{img_key}", type="primary",
+                     use_container_width=True):
             if result and result.json_data:
                 objs = result.json_data.get("objects", []) or []
                 # Extract centres in image coords.
@@ -1214,6 +1399,106 @@ def _render_axis_picker(img, axis_config, ax_key, img_key, detections, ocr_resul
                             st.session_state[k] += 1
                     st.rerun()
 
+        # ---- Numeric pixel edit (formerly a separate expander below) ----
+        # Consolidated here so the whole calibration section lives in one
+        # 2-column block. Value inputs above (axpick_* keys) are the
+        # single source of truth for data-space values; this block only
+        # adds pixel positions + log-scale + a typed-pixel Apply button.
+        if W_img is not None and H_img is not None and rev_key is not None:
+            st.markdown("---")
+            st.markdown("**🔢 Numeric pixel edit**")
+            st.caption(
+                "Type exact pixel positions or toggle log scale, then "
+                "press **Apply**. Values above are reused as-is."
+            )
+            pr1_c1, pr1_c2 = st.columns(2)
+            with pr1_c1:
+                nx1p = st.number_input(
+                    "X1 pixel (from left)", min_value=0, max_value=W_img,
+                    value=int(round(float(axis_config["x1_px"]))),
+                    key=f"ax_x1p_{img_key}",
+                )
+            with pr1_c2:
+                nx2p = st.number_input(
+                    "X2 pixel (from left)", min_value=0, max_value=W_img,
+                    value=int(round(float(axis_config["x2_px"]))),
+                    key=f"ax_x2p_{img_key}",
+                )
+            pr2_c1, pr2_c2 = st.columns(2)
+            with pr2_c1:
+                ny1p = st.number_input(
+                    "Y1 pixel (from top)", min_value=0, max_value=H_img,
+                    value=int(round(float(axis_config["y1_py"]))),
+                    key=f"ax_y1p_{img_key}",
+                )
+            with pr2_c2:
+                ny2p = st.number_input(
+                    "Y2 pixel (from top)", min_value=0, max_value=H_img,
+                    value=int(round(float(axis_config["y2_py"]))),
+                    key=f"ax_y2p_{img_key}",
+                )
+            log_c1, log_c2 = st.columns(2)
+            with log_c1:
+                nxlog = st.checkbox(
+                    "X is log scale",
+                    value=bool(axis_config.get("xIsLogScale", False)),
+                    key=f"ax_xlog_{img_key}",
+                )
+            with log_c2:
+                nylog = st.checkbox(
+                    "Y is log scale",
+                    value=bool(axis_config.get("yIsLogScale", False)),
+                    key=f"ax_ylog_{img_key}",
+                )
+
+            st.caption(
+                f"Pending — X: `{v_x1:g}` @ px `{nx1p}` → "
+                f"`{v_x2:g}` @ px `{nx2p}` · "
+                f"Y: `{v_y1:g}` @ py `{ny1p}` → "
+                f"`{v_y2:g}` @ py `{ny2p}` · "
+                f"log X={'on' if nxlog else 'off'}, "
+                f"Y={'on' if nylog else 'off'}"
+            )
+
+            apply_c, redetect_c = st.columns(2)
+            with apply_c:
+                if st.button("💾 Apply", key=f"ax_apply_{img_key}",
+                             use_container_width=True):
+                    new_axis = dict(axis_config)
+                    new_axis.update({
+                        "x1_val": v_x1, "x2_val": v_x2,
+                        "y1_val": v_y1, "y2_val": v_y2,
+                        "x1_px": float(nx1p), "x2_px": float(nx2p),
+                        "x1_py": float(ny1p), "x2_py": float(ny1p),
+                        "y1_px": float(nx1p), "y2_px": float(nx1p),
+                        "y1_py": float(ny1p), "y2_py": float(ny2p),
+                        "xIsLogScale": bool(nxlog),
+                        "yIsLogScale": bool(nylog),
+                    })
+                    st.session_state[ax_key] = (
+                        new_axis, detections, ocr_results)
+                    st.session_state["_show_values_after_apply"] = True
+                    st.session_state[rev_key] = rev + 1
+                    st.rerun()
+            with redetect_c:
+                if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_key}",
+                             disabled=chartdete_module is None,
+                             use_container_width=True):
+                    st.session_state.pop(ax_key, None)
+                    st.rerun()
+
+            if ocr_results:
+                ocr_text = []
+                if 'xlabels' in ocr_results:
+                    x_vals = [f"{l['value']}" for l in ocr_results['xlabels']
+                              if l['value'] is not None]
+                    ocr_text.append(f"X: [{', '.join(x_vals)}]")
+                if 'ylabels' in ocr_results:
+                    y_vals = [f"{l['value']}" for l in ocr_results['ylabels']
+                              if l['value'] is not None]
+                    ocr_text.append(f"Y: [{', '.join(y_vals)}]")
+                st.caption("OCR ticks — " + ' | '.join(ocr_text))
+
 
 def _render_single_image_pipeline(img, name, infer_module, chartdete_module, config):
     """Existing single-image workflow, refactored to accept a preloaded image."""
@@ -1250,6 +1535,8 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             summary_placeholder = st.empty()
             caption_placeholder = st.empty()
 
+        st.divider()
+
         # Placeholder for axis calibration results (outside columns)
         axis_placeholder = st.empty()
 
@@ -1258,13 +1545,21 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
         ss_key = f"series_{img_bytes_key}"
         ax_key = f"axis_{img_bytes_key}"
         rev_key = f"rev_{img_bytes_key}"
+        # Per-image extraction / resampling params. Rendered as widgets
+        # down in the Curves section, but read here so extraction (which
+        # runs before Curves) uses the latest value from the previous rerun.
+        mask_ext_key = f"mask_ext_{img_bytes_key}"
+        grid_step_key = f"x_grid_{img_bytes_key}"
+        mask_extend_px = int(st.session_state.get(mask_ext_key, 0))
+        x_step_val = float(st.session_state.get(grid_step_key, 0.0) or 0.0)
         # Raw extraction cache keyed by (image, extraction params). This is the
         # important fix — LineFormer inference used to fire on every rerun,
         # even when nothing had changed, so every canvas click / Apply / mode
         # switch re-ran a 5-15 s pipeline and the Extraction Result appeared to
         # "blink" as the spinner and result alternated.
         raw_key = (f"raw_{img_bytes_key}_{downsample_mode}_"
-                   f"{fixed_step}_{max_points}_{sort_mode}")
+                   f"{fixed_step}_{max_points}_{sort_mode}_"
+                   f"ext{mask_extend_px}")
 
         if raw_key not in st.session_state:
             # First time we've seen this image (or a params change) — run the
@@ -1272,7 +1567,8 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             with status_placeholder.container():
                 with st.spinner("⏳ Extracting lines (LineFormer)…"):
                     data_series, _raw_lines = extract_lines(
-                        infer_module, img, downsample_mode, fixed_step, max_points
+                        infer_module, img, downsample_mode, fixed_step,
+                        max_points, mask_extend_px=mask_extend_px,
                     )
                     data_series = sort_data_series(data_series, sort_mode)
             st.session_state[raw_key] = data_series
@@ -1329,158 +1625,15 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
 
         if axis_config is not None:
             with axis_placeholder.container():
-                title = ("Axis Calibration (Auto-detected — click to edit)"
-                         if detections is not None
-                         else "Axis Calibration (Manual — auto-detection unavailable)")
-                # Drag picker rendered outside any expander/tab. Nested layout
-                # (expander -> canvas, expander -> tab -> canvas) was leaving
-                # the fabric.js iframe with size 0 or unmounted, so the
-                # background never showed. Rendering at top level fixes that.
-                st.markdown("### 🎯 Drag calibration markers on chart")
-                st.caption(
-                    "Drag each dot to the tick it represents, enter the "
-                    "corresponding data value, then press **Save**. "
-                    "Red = X axis, Blue = Y axis."
+                # All calibration UI (drag markers, value inputs, pixel edit,
+                # apply/re-detect, OCR reference) is now consolidated inside
+                # _render_axis_picker's 2-column layout.
+                _render_axis_picker(
+                    img, axis_config, ax_key,
+                    img_bytes_key, detections, ocr_results,
+                    W_img=W_img, H_img=H_img, rev_key=rev_key, rev=rev,
+                    chartdete_module=chartdete_module,
                 )
-                _render_axis_picker(img, axis_config, ax_key,
-                                    img_bytes_key, detections, ocr_results)
-
-                with st.expander(title, expanded=(detections is None)):
-                    st.info(
-                        "🔢 **Numeric edit** — declares what each marker "
-                        "REPRESENTS (data-space values) and lets you type "
-                        "exact pixel positions. ⚠️ Value edits alone do NOT "
-                        "visually move the marker on the chart — use the "
-                        "**🎯 Drag calibration markers on chart** expander "
-                        "above for that.",
-                        icon="ℹ️",
-                    )
-                    if True:
-                        # Prefill from current axis_config values.
-                        st.caption("Change the tick values (data-space) or the "
-                                   "pixel positions of the four calibration points. "
-                                   "Press **Apply calibration** to redraw and "
-                                   "re-export.")
-                        xc1, xc2 = st.columns(2)
-                        with xc1:
-                            st.markdown("**X-axis**")
-                            nx1v = st.number_input(
-                                "X1 value (left tick)",
-                                value=float(axis_config["x1_val"]),
-                                key=f"ax_x1v_{img_bytes_key}", format="%.6g",
-                            )
-                            nx2v = st.number_input(
-                                "X2 value (right tick)",
-                                value=float(axis_config["x2_val"]),
-                                key=f"ax_x2v_{img_bytes_key}", format="%.6g",
-                            )
-                            nx1p = st.number_input(
-                                "X1 pixel (from left)", min_value=0, max_value=W_img,
-                                value=int(round(float(axis_config["x1_px"]))),
-                                key=f"ax_x1p_{img_bytes_key}",
-                            )
-                            nx2p = st.number_input(
-                                "X2 pixel (from left)", min_value=0, max_value=W_img,
-                                value=int(round(float(axis_config["x2_px"]))),
-                                key=f"ax_x2p_{img_bytes_key}",
-                            )
-                            nxlog = st.checkbox(
-                                "X-axis is log scale",
-                                value=bool(axis_config.get("xIsLogScale", False)),
-                                key=f"ax_xlog_{img_bytes_key}",
-                            )
-                        with xc2:
-                            st.markdown("**Y-axis**")
-                            ny1v = st.number_input(
-                                "Y1 value (bottom tick)",
-                                value=float(axis_config["y1_val"]),
-                                key=f"ax_y1v_{img_bytes_key}", format="%.6g",
-                            )
-                            ny2v = st.number_input(
-                                "Y2 value (top tick)",
-                                value=float(axis_config["y2_val"]),
-                                key=f"ax_y2v_{img_bytes_key}", format="%.6g",
-                            )
-                            # y1_py is the bottom (higher pixel), y2_py the top (lower pixel)
-                            ny1p = st.number_input(
-                                "Y1 pixel (from top, larger = lower on chart)",
-                                min_value=0, max_value=H_img,
-                                value=int(round(float(axis_config["y1_py"]))),
-                                key=f"ax_y1p_{img_bytes_key}",
-                            )
-                            ny2p = st.number_input(
-                                "Y2 pixel (from top, smaller = higher on chart)",
-                                min_value=0, max_value=H_img,
-                                value=int(round(float(axis_config["y2_py"]))),
-                                key=f"ax_y2p_{img_bytes_key}",
-                            )
-                            nylog = st.checkbox(
-                                "Y-axis is log scale",
-                                value=bool(axis_config.get("yIsLogScale", False)),
-                                key=f"ax_ylog_{img_bytes_key}",
-                            )
-
-                        # Live readout so the user can confirm the values that will
-                        # be applied — changing only the value (not the pixel)
-                        # doesn't visually move the marker on the chart, so this
-                        # panel is the primary "did my edit take?" feedback.
-                        st.markdown(
-                            "**Pending calibration (will apply on click):**\n\n"
-                            f"- X: `{nx1v:g}` @ px `{nx1p}` → "
-                            f"`{nx2v:g}` @ px `{nx2p}`\n"
-                            f"- Y: `{ny1v:g}` @ py `{ny1p}` → "
-                            f"`{ny2v:g}` @ py `{ny2p}`\n"
-                            f"- Log scales: X={'on' if nxlog else 'off'}, "
-                            f"Y={'on' if nylog else 'off'}"
-                        )
-
-                        apply_col, reset_col, _ = st.columns([1, 1, 3])
-                        with apply_col:
-                            if st.button("💾 Apply calibration",
-                                         key=f"ax_apply_{img_bytes_key}",
-                                         type="primary"):
-                                new_axis = dict(axis_config)
-                                new_axis.update({
-                                    "x1_val": nx1v, "x2_val": nx2v,
-                                    "y1_val": ny1v, "y2_val": ny2v,
-                                    "x1_px": float(nx1p), "x2_px": float(nx2p),
-                                    # X calibration line runs along the bottom of
-                                    # the plot; keep both endpoints at the same y.
-                                    "x1_py": float(ny1p), "x2_py": float(ny1p),
-                                    # Y calibration runs along the left of the plot;
-                                    # keep both endpoints at the same x.
-                                    "y1_px": float(nx1p), "y2_px": float(nx1p),
-                                    "y1_py": float(ny1p), "y2_py": float(ny2p),
-                                    "xIsLogScale": bool(nxlog),
-                                    "yIsLogScale": bool(nylog),
-                                })
-                                st.session_state[ax_key] = (new_axis, detections, ocr_results)
-                                # Auto-enable value labels on the chart so the user
-                                # can visually confirm that a value-only edit (e.g.
-                                # Y2: 200 → 250 with pixel unchanged) actually
-                                # landed — otherwise the marker sits in the same
-                                # pixel and looks like nothing happened.
-                                st.session_state["_show_values_after_apply"] = True
-                                # Bump rev so the XY table (which converts pixels via
-                                # this calibration) is forced to refresh from source.
-                                st.session_state[rev_key] = rev + 1
-                                st.rerun()
-                        with reset_col:
-                            if st.button("↩︎ Re-detect", key=f"ax_redetect_{img_bytes_key}",
-                                         disabled=chartdete_module is None):
-                                st.session_state.pop(ax_key, None)
-                                st.rerun()
-
-                        if ocr_results:
-                            st.markdown("**OCR-detected tick labels (reference):**")
-                            ocr_text = []
-                            if 'xlabels' in ocr_results:
-                                x_vals = [f"{l['value']}" for l in ocr_results['xlabels'] if l['value'] is not None]
-                                ocr_text.append(f"X: [{', '.join(x_vals)}]")
-                            if 'ylabels' in ocr_results:
-                                y_vals = [f"{l['value']}" for l in ocr_results['ylabels'] if l['value'] is not None]
-                                ocr_text.append(f"Y: [{', '.join(y_vals)}]")
-                            st.caption(' | '.join(ocr_text))
         elif auto_axis:
             axis_placeholder.warning(
                 "Could not auto-detect axis calibration. Enable manual "
@@ -1528,13 +1681,11 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
                     for i, nm in enumerate(st.session_state[legend_key]):
                         st.write(f"Line {i+1}: **{nm}**")
 
-        # ---- Per-curve inspection & editing ----
-        st.subheader("Curves")
+        # ---- (Curves section was here — moved below Edit Points so the
+        # primary editing surface (SD embed) comes first. Keep rendering
+        # the Curves content later; the top viz_placeholder is still
+        # populated by draw_points_on_image inside that block.)
         legend_names = st.session_state.get(f"legend_names_{img_bytes_key}", [])
-        # Options are stable identifiers ("all" or int line index) so the
-        # selection survives when a line's point count changes mid-session
-        # (e.g. Delete mode removed a point). Point count is shown only via
-        # format_func, not baked into the option value itself.
         options = ["all"] + list(range(len(edited_series)))
 
         def _curve_label(opt):
@@ -1546,218 +1697,150 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             base = f"Line {i+1}" + (f" — {nm}" if nm else "")
             return f"{base}  ({len(edited_series[i]['points'])} pts)"
 
-        sel = st.selectbox(
-            "Show", options, index=0,
-            format_func=_curve_label,
-            key=f"curve_sel_{img_bytes_key}",
-            help="Pick a single line to isolate it in the visualization and "
-                 "edit its X/Y points below.",
-        )
-
-        if sel == "all":
-            viz_data = edited_series
-            viz_indices = list(range(len(edited_series)))
-            highlight = None
-        else:
-            idx = int(sel)
-            viz_data = [edited_series[idx]]
-            viz_indices = [idx]
-            highlight = idx
-
-        # Re-render viz with selection + numbers baked in.
-        # Sticky "burn values after Apply" flag: once the user edits
-        # calibration, keep values visible so subsequent value-only edits
-        # remain visible; sidebar toggle still overrides when explicitly set.
-        show_vals = (config.get("show_calibration_values", False)
-                     or st.session_state.get("_show_values_after_apply", False))
-        if show_visualization:
-            result_img = draw_points_on_image(
-                img, viz_data, axis_config,
-                show_calibration=config.get("show_calibration", True),
-                show_calibration_values=show_vals,
-                show_line_numbers=True,
-                highlight_idx=highlight,
-                line_indices=viz_indices,
-                total_lines=len(edited_series),
-            )
-            viz_placeholder.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
-                                  use_container_width=True)
-
-        # Visual editor + XY table for the selected single curve.
-        if sel != "all":
-            idx = int(sel)
-
-            # Rebuild the color palette so the visual editor matches the
-            # numbered chart above.
-            import line_utils
-            palette = list(line_utils.get_distinct_colors(max(1, len(edited_series))))
-
-            with st.expander("🎯 Visual editor (click to add / delete points)",
-                             expanded=True):
-                _render_visual_editor(
-                    img, edited_series, axis_config, idx,
-                    ss_key, img_bytes_key, palette,
-                )
-
-            pts_px = edited_series[idx]["points"]
-            if axis_config is not None:
-                rows = [_pixel_to_data(p[0], p[1], axis_config) for p in pts_px]
-                cols = ("X", "Y")
-                cal_note = " (data-space, using detected calibration)"
-            else:
-                rows = [(float(p[0]), float(p[1])) for p in pts_px]
-                cols = ("X_px", "Y_px")
-                cal_note = " (pixel coords — no calibration detected)"
-            df = pd.DataFrame(rows, columns=cols)
-            st.caption(f"Line {idx+1} — {len(rows)} points{cal_note}. "
-                       "Edit any cell, add rows at the bottom, or use the row "
-                       "checkbox + Delete key to remove points.")
-            # rev is bumped by the visual editor / axis calibration Apply so
-            # the data_editor's cached user-edit deltas can't shadow fresh
-            # points that came from a canvas drag or a recalibrated axis.
-            edited_df = st.data_editor(
-                df, num_rows="dynamic", use_container_width=True,
-                # Read rev fresh from session_state so a mid-rerun bump (Move
-                # mode saves without st.rerun) is reflected in the widget key.
-                key=(f"editor_{img_bytes_key}_{idx}_r"
-                     f"{st.session_state.get(rev_key, rev)}"),
-                column_config={c: st.column_config.NumberColumn(c, format="%.6g")
-                               for c in cols},
-            )
-
-            new_pts = []
-            for row in edited_df.itertuples(index=False):
-                try:
-                    x, y = float(row[0]), float(row[1])
-                except (TypeError, ValueError):
-                    continue
-                if not (np.isfinite(x) and np.isfinite(y)):
-                    continue
-                if axis_config is not None:
-                    px, py = _data_to_pixel(x, y, axis_config)
-                else:
-                    px, py = x, y
-                new_pts.append([int(round(px)), int(round(py))])
-
-            btn_col1, btn_col2, btn_col3, _ = st.columns([1, 1, 1, 2])
-            with btn_col1:
-                if st.button("💾 Apply edits", key=f"apply_{img_bytes_key}_{idx}",
-                             type="primary"):
-                    st.session_state[ss_key][idx]["points"] = new_pts
-                    st.rerun()
-            with btn_col2:
-                if st.button("↩︎ Reset this line",
-                             key=f"reset_{img_bytes_key}_{idx}",
-                             help="Restore this line's auto-detected points."):
-                    st.session_state[ss_key][idx]["points"] = copy.deepcopy(
-                        data_series[idx]["points"])
-                    st.rerun()
-            with btn_col3:
-                # Two-step confirm so an accidental click doesn't wipe a whole
-                # line. Session flag remembers the arm state per line/image.
-                arm_key = f"delline_arm_{img_bytes_key}_{idx}"
-                if st.session_state.get(arm_key):
-                    if st.button(f"⚠️ Confirm delete Line {idx+1}",
-                                 key=f"del_confirm_{img_bytes_key}_{idx}",
-                                 type="secondary",
-                                 help="This drops the entire line from the "
-                                      "session — Reset all lines can bring "
-                                      "it back."):
-                        # Drop the line entirely.
-                        del st.session_state[ss_key][idx]
-                        st.session_state.pop(arm_key, None)
-                        # Streamlit forbids ASSIGNING to a widget's state
-                        # after it was rendered in the current run, but a
-                        # delete is allowed. On the next rerun the selectbox
-                        # will fall back to its default (index 0 = "all").
-                        sel_key = f"curve_sel_{img_bytes_key}"
-                        st.session_state.pop(sel_key, None)
-                        st.session_state[rev_key] = rev + 1
-                        st.rerun()
-                    if st.button("Cancel",
-                                 key=f"del_cancel_{img_bytes_key}_{idx}"):
-                        st.session_state.pop(arm_key, None)
-                        st.rerun()
-                else:
-                    if st.button(f"🗑 Delete entire Line {idx+1}",
-                                 key=f"del_line_{img_bytes_key}_{idx}",
-                                 help="Remove this line from the extraction. "
-                                      "You'll be asked to confirm."):
-                        st.session_state[arm_key] = True
-                        st.rerun()
-
-            if len(new_pts) != len(pts_px):
-                st.info(f"Pending: {len(new_pts)} points "
-                        f"(was {len(pts_px)}). Press **Apply edits** to save.")
-
-        else:
-            reset_col1, _ = st.columns([1, 4])
-            with reset_col1:
-                if st.button("↩︎ Reset all lines to auto-detected",
-                             key=f"reset_all_{img_bytes_key}"):
-                    st.session_state[ss_key] = copy.deepcopy(data_series)
-                    # Reset any partially-armed delete buttons.
-                    for k in list(st.session_state):
-                        if k.startswith(f"delline_arm_{img_bytes_key}"):
-                            st.session_state.pop(k, None)
-                    st.rerun()
-
-        # Downloads/exports use the *edited* series so user changes reach WPD/SD.
-        # Build StarryDigitizer project
+        # ---- Build project data (needed by SD embed + exports) ----
+        # Must run BEFORE Edit Points below. The user's manual tweaks in
+        # the Curves section further down flow back here via session_state
+        # on the next rerun.
         project_json = convert_to_starry_digitizer_format(
             edited_series, img.shape, axis_config
         )
-
-        # Build WebPlotDigitizer project
         wpd_json = convert_to_wpd_format(
             edited_series, img.shape, axis_config
         )
-
-        # Create ZIP file for StarryDigitizer
         zip_buffer = create_starry_digitizer_zip(img, project_json)
-
-        # Create TAR file for WebPlotDigitizer
         base_name = os.path.splitext(name)[0]
         tar_buffer = create_wpd_tar(img, wpd_json, project_name=base_name)
-
-        # Generate filenames
         timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
         zip_filename = f"sd-{timestamp_str}.zip"
         tar_filename = f"wpd-{timestamp_str}.tar"
 
-        # Download buttons
-        st.subheader("Download")
-        col_dl1, col_dl2, col_dl3 = st.columns(3)
-
-        with col_dl1:
-            st.download_button(
-                label="📦 StarryDigitizer (.zip)",
-                data=zip_buffer.getvalue(),
-                file_name=zip_filename,
-                mime="application/zip",
-                help="ZIP containing image.png + project.json"
+        # Pre-compute the highlighted result image (viz_placeholder is still
+        # at the top — Curves selection updates it even though the Curves
+        # section itself now renders below Edit Points).
+        show_vals = (config.get("show_calibration_values", False)
+                     or st.session_state.get("_show_values_after_apply", False))
+        if show_visualization:
+            result_img = draw_points_on_image(
+                img, edited_series, axis_config,
+                show_calibration=config.get("show_calibration", True),
+                show_calibration_values=show_vals,
+                show_line_numbers=True,
+                highlight_idx=None,
+                line_indices=list(range(len(edited_series))),
+                total_lines=len(edited_series),
+            )
+            viz_placeholder.image(
+                cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
+                use_container_width=True,
             )
 
-        with col_dl2:
+        st.divider()
+
+        # ---- Embedded StarryDigitizer with auto-loaded project ----
+        # Primary editing surface.
+        st.subheader("Edit points")
+        import streamlit.components.v1 as components
+        import base64
+        zip_b64 = base64.b64encode(zip_buffer.getvalue()).decode('ascii')
+        # Fork with postMessage bridge:
+        # https://github.com/atsumitanaka/starry-digitizer
+        embed_html = f"""
+<style>
+  #sd-frame {{ width:100%; height:680px; border:0; }}
+  #sd-status {{ font: 12px/1.3 sans-serif; color:#555; margin:2px 0 6px;
+    padding: 4px 8px; background:#f5f5f5; border-radius:4px; }}
+</style>
+<div id="sd-status">⏳ Loading StarryDigitizer…</div>
+<iframe id="sd-frame"
+        src="https://starry-digitizer.vercel.app/"
+        allow="clipboard-read; clipboard-write"></iframe>
+<script>
+(function() {{
+  const ZIP_B64 = "{zip_b64}";
+  const frame = document.getElementById('sd-frame');
+  const status = document.getElementById('sd-status');
+
+  let loaded = false;
+  let attempts = 0;
+
+  function sendProject(trigger) {{
+    if (loaded) return;
+    attempts += 1;
+    status.textContent = `📤 Sending project (attempt ${{attempts}}, via ${{trigger}})…`;
+    try {{
+      frame.contentWindow.postMessage(
+        {{ type: 'load-project', zipBase64: ZIP_B64 }},
+        '*'
+      );
+    }} catch (e) {{
+      status.textContent = '❌ postMessage failed: ' + e.message;
+    }}
+  }}
+
+  window.addEventListener('message', (event) => {{
+    if (!event.data || typeof event.data !== 'object') return;
+    if (event.data.type === 'starrydigitizer-ready') {{
+      sendProject('ready');
+    }} else if (event.data.type === 'starrydigitizer-loaded') {{
+      loaded = true;
+      status.textContent = '✅ Project loaded — edit in the panel below.';
+    }} else if (event.data.type === 'starrydigitizer-error') {{
+      status.textContent = '❌ ' + (event.data.message || 'Load failed');
+    }}
+  }});
+
+  // Multiple triggers so at least one lands:
+  // 1) iframe.onload — fires when the SD document finishes loading
+  frame.addEventListener('load', () => {{
+    setTimeout(() => sendProject('onload'), 1200);
+  }});
+  // 2) Blind retries in case ready / onload were missed entirely
+  setTimeout(() => sendProject('retry-3s'), 3000);
+  setTimeout(() => sendProject('retry-7s'), 7000);
+  setTimeout(() => {{
+    if (!loaded) status.textContent =
+      '⚠️ No load confirmation after 10s. Try refreshing or drag the ZIP manually.';
+  }}, 10000);
+}})();
+</script>
+"""
+        components.html(embed_html, height=740)
+
+        # ---- Alternative editor: wpd-auto on starryai (NIMS intranet) ----
+        # Collector feedback: wpd-auto's manual-point picking is more reliable
+        # than the embedded StarryDigitizer above for some figure styles.
+        # X-Frame-Options:DENY on the nginx side rules out iframe embed, so
+        # the flow is: download the WPD TAR here, open wpd-auto in a new tab,
+        # drag the TAR in.
+        st.markdown("**Alternative editor — wpd-auto (NIMS):**")
+        col_wpda_1, col_wpda_2 = st.columns(2)
+        with col_wpda_1:
             st.download_button(
-                label="📊 WebPlotDigitizer (.tar)",
+                label="📊 Download WPD TAR",
                 data=tar_buffer.getvalue(),
                 file_name=tar_filename,
                 mime="application/x-tar",
-                help="TAR with project folder structure"
+                help="TAR to load in wpd-auto. "
+                     "Same file as in 'Other exports' below.",
+                key=f"wpd_tar_dl_edit_{img_bytes_key}",
+                use_container_width=True,
             )
+        with col_wpda_2:
+            st.link_button(
+                "🔗 Open wpd-auto",
+                "http://starryai.nims.go.jp/wpd-auto/",
+                help="Opens wpd-auto in a new tab (NIMS intranet only). "
+                     "Then File → Load Project → drag the downloaded TAR.",
+                use_container_width=True,
+            )
+        st.caption(
+            "Workflow: Download TAR → Open wpd-auto → File → Load Project → "
+            "drag the TAR. Reachable only from the NIMS intranet."
+        )
 
-        with col_dl3:
-            if show_visualization:
-                _, buffer = cv2.imencode('.png', result_img)
-                st.download_button(
-                    label="🖼️ Visualization (.png)",
-                    data=buffer.tobytes(),
-                    file_name=f"{base_name}_result.png",
-                    mime="image/png"
-                )
+        st.divider()
 
-        # ---- CSV export of the edited curves ----
+        # ---- CSV quick export (kept close to the editor for convenience) ----
         csv_lines = ["line,x,y"]
         for li, s in enumerate(edited_series, 1):
             for p in s["points"]:
@@ -1776,27 +1859,235 @@ def _render_single_image_pipeline(img, name, infer_module, chartdete_module, con
             key=f"csv_dl_{img_bytes_key}",
         )
 
-        # Show JSON previews
-        with st.expander("Preview StarryDigitizer project.json"):
-            json_str = json.dumps(project_json, indent=2, ensure_ascii=False)
-            if len(json_str) > 5000:
-                st.code(json_str[:5000] + "\n... (truncated)", language="json")
+        st.divider()
+
+        # ---- Verify / tweak (formerly the "Curves" section) ----
+        # Controls row: X-grid step, Extend-mask, Resample, Reset — all
+        # live right next to the Resample button so the related settings
+        # and the action are discovered together.
+        can_resample = x_step_val > 0 and axis_config is not None
+        ctrl_c1, ctrl_c2, ctrl_c3, ctrl_c4 = st.columns([1, 1, 1.4, 1])
+        with ctrl_c1:
+            st.number_input(
+                "X grid step (data-space, 0=off)",
+                min_value=0.0, step=1.0, format="%.6g",
+                value=x_step_val,
+                key=grid_step_key,
+                help="Resample X values to multiples of this step after "
+                     "axis calibration. 0 disables.",
+            )
+        with ctrl_c2:
+            st.slider(
+                "Extend mask (px)",
+                min_value=0, max_value=20, value=mask_extend_px,
+                key=mask_ext_key,
+                help="Horizontally dilate each LineFormer mask by N "
+                     "pixels before extraction. Recovers edge points "
+                     "that the model dropped. 3-5 is a good start.",
+            )
+        with ctrl_c3:
+            if st.button(
+                    f"🔁 Resample to X grid"
+                    + (f" (step={x_step_val:g})" if x_step_val > 0 else ""),
+                    key=f"resample_x_{img_bytes_key}",
+                    disabled=not can_resample,
+                    help=("Replace each curve's points with values on "
+                          "X = k · step (interpolated Y). Needs a step > 0 "
+                          "and a valid axis calibration."),
+                    use_container_width=True):
+                st.session_state[ss_key] = resample_curves_by_x_grid(
+                    edited_series, axis_config, x_step_val)
+                st.session_state[rev_key] = rev + 1
+                st.rerun()
+        with ctrl_c4:
+            if st.button("↩︎ Reset all lines",
+                         key=f"reset_all_{img_bytes_key}",
+                         use_container_width=True,
+                         help="Restore every line to the raw auto-detected "
+                              "extraction."):
+                st.session_state[ss_key] = copy.deepcopy(data_series)
+                for k in list(st.session_state):
+                    if k.startswith(f"delline_arm_{img_bytes_key}"):
+                        st.session_state.pop(k, None)
+                st.rerun()
+
+        sel = st.selectbox(
+            "Isolate / edit a single line (optional)",
+            options, index=0,
+            format_func=_curve_label,
+            key=f"curve_sel_{img_bytes_key}",
+            help="Pick a single line to isolate it in the top chart and "
+                 "edit its X/Y points below.",
+        )
+
+        if sel != "all":
+            idx = int(sel)
+            # Repaint top viz with just the selected line highlighted.
+            if show_visualization:
+                hl_img = draw_points_on_image(
+                    img, [edited_series[idx]], axis_config,
+                    show_calibration=config.get("show_calibration", True),
+                    show_calibration_values=show_vals,
+                    show_line_numbers=True,
+                    highlight_idx=idx,
+                    line_indices=[idx],
+                    total_lines=len(edited_series),
+                )
+                viz_placeholder.image(
+                    cv2.cvtColor(hl_img, cv2.COLOR_BGR2RGB),
+                    use_container_width=True,
+                )
+
+            pts_px = edited_series[idx]["points"]
+            if axis_config is not None:
+                rows = [_pixel_to_data(p[0], p[1], axis_config) for p in pts_px]
+                cols_ = ("X", "Y")
+                cal_note = "data-space (calibrated)"
             else:
-                st.code(json_str, language="json")
+                rows = [(float(p[0]), float(p[1])) for p in pts_px]
+                cols_ = ("X_px", "Y_px")
+                cal_note = "pixel coords (no calibration)"
+            df = pd.DataFrame(rows, columns=cols_)
 
-        with st.expander("Preview WebPlotDigitizer wpd.json"):
-            wpd_preview = json.dumps(wpd_json, indent=2, ensure_ascii=False)
-            if len(wpd_preview) > 5000:
-                st.code(wpd_preview[:5000] + "\n... (truncated)", language="json")
-            else:
-                st.code(wpd_preview, language="json")
+            table_col, actions_col = st.columns([3, 2])
+            with table_col:
+                st.caption(
+                    f"Line {idx+1} — {len(rows)} pts · {cal_note}. "
+                    "Edit cells, add rows at the bottom, or check + Delete "
+                    "to remove."
+                )
+                edited_df = st.data_editor(
+                    df, num_rows="dynamic", use_container_width=True,
+                    key=(f"editor_{img_bytes_key}_{idx}_r"
+                         f"{st.session_state.get(rev_key, rev)}"),
+                    column_config={c: st.column_config.NumberColumn(
+                        c, format="%.6g") for c in cols_},
+                )
+                new_pts = []
+                for row in edited_df.itertuples(index=False):
+                    try:
+                        x, y = float(row[0]), float(row[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if not (np.isfinite(x) and np.isfinite(y)):
+                        continue
+                    if axis_config is not None:
+                        px, py = _data_to_pixel(x, y, axis_config)
+                    else:
+                        px, py = x, y
+                    new_pts.append([float(px), float(py)])
 
-        # Instructions
-        st.info("""
-        **StarryDigitizer:** Download ZIP → Open [StarryDigitizer](https://starrydigitizer.vercel.app/) → Load Project
+                if len(new_pts) != len(pts_px):
+                    st.info(
+                        f"Pending: {len(new_pts)} points (was {len(pts_px)}). "
+                        "Press **Apply edits**."
+                    )
 
-        **WebPlotDigitizer:** Download TAR → Open [WPD](https://apps.automeris.io/wpd4/) → File → Load Project (.tar)
-        """)
+            with actions_col:
+                st.markdown("**Actions**")
+                if st.button("💾 Apply edits",
+                             key=f"apply_{img_bytes_key}_{idx}",
+                             type="primary",
+                             use_container_width=True):
+                    st.session_state[ss_key][idx]["points"] = new_pts
+                    st.rerun()
+                if st.button("↩︎ Reset this line",
+                             key=f"reset_{img_bytes_key}_{idx}",
+                             help="Restore this line's auto-detected points.",
+                             use_container_width=True):
+                    st.session_state[ss_key][idx]["points"] = copy.deepcopy(
+                        data_series[idx]["points"])
+                    st.rerun()
+
+                arm_key = f"delline_arm_{img_bytes_key}_{idx}"
+                if st.session_state.get(arm_key):
+                    if st.button(f"⚠️ Confirm delete Line {idx+1}",
+                                 key=f"del_confirm_{img_bytes_key}_{idx}",
+                                 use_container_width=True):
+                        del st.session_state[ss_key][idx]
+                        st.session_state.pop(arm_key, None)
+                        sel_key = f"curve_sel_{img_bytes_key}"
+                        st.session_state.pop(sel_key, None)
+                        st.session_state[rev_key] = rev + 1
+                        st.rerun()
+                    if st.button("Cancel",
+                                 key=f"del_cancel_{img_bytes_key}_{idx}",
+                                 use_container_width=True):
+                        st.session_state.pop(arm_key, None)
+                        st.rerun()
+                else:
+                    if st.button(f"🗑 Delete entire Line {idx+1}",
+                                 key=f"del_line_{img_bytes_key}_{idx}",
+                                 help="Remove this line from the extraction.",
+                                 use_container_width=True):
+                        st.session_state[arm_key] = True
+                        st.rerun()
+
+        st.divider()
+
+        # ---- Everything else lives inside a single collapsed section so it
+        # stays out of the way. ----
+        with st.expander("📁 Other exports & previews", expanded=False):
+            col_dl1, col_dl2, col_dl3 = st.columns(3)
+
+            with col_dl1:
+                st.download_button(
+                    label="📦 StarryDigitizer (.zip)",
+                    data=zip_buffer.getvalue(),
+                    file_name=zip_filename,
+                    mime="application/zip",
+                    help="Backup of the current extraction — the same "
+                         "ZIP that is auto-loaded into the embedded "
+                         "editor above.",
+                )
+
+            with col_dl2:
+                st.download_button(
+                    label="📊 WebPlotDigitizer (.tar)",
+                    data=tar_buffer.getvalue(),
+                    file_name=tar_filename,
+                    mime="application/x-tar",
+                    help="TAR with project folder structure"
+                )
+
+            with col_dl3:
+                if show_visualization:
+                    _, buffer = cv2.imencode('.png', result_img)
+                    st.download_button(
+                        label="🖼️ Visualization (.png)",
+                        data=buffer.tobytes(),
+                        file_name=f"{base_name}_result.png",
+                        mime="image/png"
+                    )
+
+            st.caption(
+                "WebPlotDigitizer alternative: Download TAR → Open "
+                "[WPD](https://apps.automeris.io/wpd4/) → File → Load "
+                "Project (.tar)"
+            )
+
+            # Nested expanders aren't allowed in Streamlit — use tabs
+            # so the two JSON previews still coexist inside this section.
+            prev_sd_tab, prev_wpd_tab = st.tabs([
+                "project.json (StarryDigitizer)",
+                "wpd.json (WebPlotDigitizer)",
+            ])
+            with prev_sd_tab:
+                json_str = json.dumps(project_json, indent=2,
+                                      ensure_ascii=False)
+                if len(json_str) > 5000:
+                    st.code(json_str[:5000] + "\n... (truncated)",
+                            language="json")
+                else:
+                    st.code(json_str, language="json")
+            with prev_wpd_tab:
+                wpd_preview = json.dumps(wpd_json, indent=2,
+                                         ensure_ascii=False)
+                if len(wpd_preview) > 5000:
+                    st.code(wpd_preview[:5000] + "\n... (truncated)",
+                            language="json")
+                else:
+                    st.code(wpd_preview, language="json")
 
 
 def single_image_tab(infer_module, chartdete_module, config):
@@ -1870,6 +2161,230 @@ def pdf_gallery_tab(infer_module, chartdete_module, config):
         fig_bgr, fig_meta = figs[sel]
         base = f"{os.path.splitext(st.session_state['pdf_name'])[0]}_fig{sel+1}.png"
         _render_single_image_pipeline(fig_bgr, base, infer_module, chartdete_module, config)
+
+
+def paper_to_wpda_tab(config):
+    """Paper PDF → figure gallery → optional ROI → wpd-auto handoff.
+
+    No LineFormer / no ChartDete: the figure image (or a cropped ROI) is
+    handed to wpd-auto (starryai) where the user does axis calibration and
+    point picking. One tab replaces the Single-Image + PDF-Gallery pair for
+    the wpd-auto-centric workflow.
+    """
+    st.markdown(
+        "論文 PDF をドロップ → 自動で抽出された図を選ぶ → "
+        "そのまま or マウスドラッグで切り出して → "
+        "[wpd-auto](http://starryai.nims.go.jp/wpd-auto/) に送ります。"
+    )
+
+    try:
+        import pdf_figures as _pf  # noqa: F401
+    except Exception as e:
+        st.error(f"PDF support unavailable: {e}")
+        return
+
+    pdf_file = st.file_uploader(
+        "論文 PDF", type=["pdf"], key="paper_wpda_pdf"
+    )
+    if pdf_file is None:
+        st.info("PDF をここにドロップしてください。")
+        return
+
+    ss = st.session_state
+    k_bytes, k_name = "paper_wpda_pdf_bytes", "paper_wpda_pdf_name"
+    k_figs, k_sel = "paper_wpda_figs", "paper_wpda_sel"
+    if ss.get(k_name) != pdf_file.name:
+        ss[k_bytes] = pdf_file.getvalue()
+        ss[k_name] = pdf_file.name
+        ss.pop(k_figs, None)
+        ss.pop(k_sel, None)
+
+    if k_figs not in ss:
+        import tempfile
+        import pdf_figures as pf
+        with st.spinner("図を抽出中…"):
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(ss[k_bytes])
+                pdf_path = tmp.name
+            try:
+                ss[k_figs] = list(pf.extract_figures(pdf_path))
+            except Exception as e:
+                st.error(f"Figure extraction failed: {e}")
+                return
+
+    figs = ss[k_figs]
+    if not figs:
+        st.warning("この PDF から図を抽出できませんでした。")
+        return
+
+    st.success(f"{len(figs)} 枚の図を検出しました。下から選んでください。")
+
+    n_cols = 4
+    cols = st.columns(n_cols)
+    for i, (fig_bgr, meta) in enumerate(figs):
+        with cols[i % n_cols]:
+            st.image(
+                cv2.cvtColor(fig_bgr, cv2.COLOR_BGR2RGB),
+                caption=f"#{i+1} (p.{meta.get('page','?')})",
+                use_container_width=True,
+            )
+            if st.button(
+                f"選ぶ #{i+1}",
+                key=f"paper_wpda_sel_btn_{i}",
+                use_container_width=True,
+            ):
+                ss[k_sel] = i
+                st.rerun()
+
+    sel = ss.get(k_sel)
+    if sel is None:
+        st.info("図を選ぶと、ここに切り出し＆送信 UI が出ます。")
+        return
+
+    st.divider()
+    fig_bgr, fig_meta = figs[sel]
+    base_name = os.path.splitext(ss[k_name])[0]
+    st.subheader(f"選択中: #{sel+1} (p.{fig_meta.get('page','?')})")
+
+    mode = st.radio(
+        "送るモード",
+        ["そのまま使う", "範囲指定して切り出す"],
+        key="paper_wpda_mode",
+        horizontal=True,
+    )
+
+    if mode == "そのまま使う":
+        send_bgr = fig_bgr
+        st.image(
+            cv2.cvtColor(send_bgr, cv2.COLOR_BGR2RGB),
+            caption="このまま wpd-auto に送ります",
+            use_container_width=True,
+        )
+    else:
+        from streamlit_drawable_canvas import st_canvas
+        from PIL import Image as _Image
+
+        rgb = cv2.cvtColor(fig_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = _Image.fromarray(rgb)
+        H, W = fig_bgr.shape[:2]
+        canvas_w = min(800, W)
+        scale = canvas_w / W if W > 0 else 1.0
+        canvas_h = int(H * scale)
+
+        st.caption(
+            "マウスで矩形をドラッグして、切り出したい範囲を囲んでください。"
+            "複数描いた場合は最後の矩形が使われます。"
+        )
+        canvas_result = st_canvas(
+            fill_color="rgba(255,165,0,0.15)",
+            stroke_width=2,
+            stroke_color="#ff5a1f",
+            background_image=pil_img,
+            update_streamlit=True,
+            height=canvas_h,
+            width=canvas_w,
+            drawing_mode="rect",
+            key=f"paper_wpda_canvas_{sel}",
+        )
+
+        rect = None
+        if canvas_result.json_data:
+            objs = canvas_result.json_data.get("objects") or []
+            rects = [o for o in objs if o.get("type") == "rect"]
+            if rects:
+                rect = rects[-1]
+
+        if rect is None:
+            st.info("まだ矩形を描いていません。")
+            return
+
+        left = max(0, int(rect["left"] / scale))
+        top = max(0, int(rect["top"] / scale))
+        w = int(rect["width"] * rect.get("scaleX", 1) / scale)
+        h = int(rect["height"] * rect.get("scaleY", 1) / scale)
+        right = min(W, left + w)
+        bottom = min(H, top + h)
+        if right - left < 10 or bottom - top < 10:
+            st.warning("矩形が小さすぎます。もう一度描いてください。")
+            return
+
+        send_bgr = fig_bgr[top:bottom, left:right].copy()
+        st.image(
+            cv2.cvtColor(send_bgr, cv2.COLOR_BGR2RGB),
+            caption=f"切り出し: {send_bgr.shape[1]}×{send_bgr.shape[0]} px",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("wpd-auto に送る")
+
+    ok, png = cv2.imencode('.png', send_bgr)
+    if not ok:
+        st.error("PNG エンコードに失敗しました。")
+        return
+    png_bytes = png.tobytes()
+    png_b64 = base64.b64encode(png_bytes).decode('ascii')
+
+    out_name = f"{base_name}_fig{sel+1}"
+    if mode != "そのまま使う":
+        out_name += "_crop"
+    out_name += ".png"
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.download_button(
+            "📥 PNG をダウンロード",
+            data=png_bytes,
+            file_name=out_name,
+            mime="image/png",
+            use_container_width=True,
+            key=f"paper_wpda_dl_{sel}",
+        )
+    with col_b:
+        import streamlit.components.v1 as components
+        copy_html = f"""
+<style>
+  #cb-btn {{ width:100%; padding:0.5em; border:1px solid #d0d0d0;
+    border-radius:0.3em; background:#fff; cursor:pointer; font-size:14px; }}
+  #cb-btn:hover {{ background:#f0f0f0; }}
+  #cb-status {{ font:12px/1.3 sans-serif; color:#555; margin-top:4px; }}
+</style>
+<button id="cb-btn" onclick="copyImg()">📋 クリップボードにコピー</button>
+<div id="cb-status"></div>
+<script>
+async function copyImg() {{
+  const b64 = "{png_b64}";
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], {{type: 'image/png'}});
+  try {{
+    await navigator.clipboard.write([
+      new ClipboardItem({{'image/png': blob}})
+    ]);
+    document.getElementById('cb-status').textContent =
+      '✅ コピーしました。wpd-auto で Ctrl+V(⌘+V)。';
+  }} catch (e) {{
+    document.getElementById('cb-status').textContent =
+      '❌ コピー失敗 (' + e.message + ')。PNG ダウンロードを使ってください。';
+  }}
+}}
+</script>
+"""
+        components.html(copy_html, height=90)
+    with col_c:
+        st.link_button(
+            "🔗 wpd-auto を開く",
+            "http://starryai.nims.go.jp/wpd-auto/",
+            help="新しいタブで wpd-auto を開きます（NIMS イントラ）。",
+            use_container_width=True,
+        )
+
+    st.caption(
+        "推奨フロー: 📋 でコピー → 🔗 で wpd-auto を開く → 画像エリアで "
+        "Ctrl+V / ⌘+V。コピーが動かない場合は 📥 で PNG を保存して、"
+        "wpd-auto の *File → Load Image* で読み込ませてください。"
+    )
 
 
 def scatter_tab(config):
@@ -2345,7 +2860,7 @@ def vlm_kmds_tab():
                 st.warning(f"'{q}' is not in the KMDS vocabulary. "
                            "It would be created as an extension term on first use.")
     else:
-        st.info("KMDS vocabulary not loaded (kmds_v15.2.4_nullable.json missing?).")
+        st.info("KMDS vocabulary not loaded (ncmrd_schema_tanaka.json missing?).")
 
     st.divider()
 
@@ -2486,12 +3001,18 @@ def main():
       [data-testid="stImage"] > img,
       div[data-testid="stImage"] img {
         max-width: 100% !important;
-        max-height: 55vh !important;
+        max-height: 38vh !important;
         width: auto !important;
         height: auto !important;
         margin: 0 auto !important;
         display: block !important;
         object-fit: contain !important;
+      }
+      /* Data editor: cap height so it doesn't push everything below it
+         off-screen; a scrollbar appears inside the table instead. */
+      [data-testid="stDataEditor"] > div {
+        max-height: 42vh !important;
+        overflow-y: auto !important;
       }
       /* Column must be allowed to shrink below its content (default
          min-width:auto blocks that) but NOT clip children — clipping
@@ -2516,10 +3037,30 @@ def main():
 
       div[data-testid="stExpander"] summary {padding: 0.25rem 0.5rem;}
       h1 {font-size: 1.4rem !important; margin: 0.2rem 0 0.3rem 0 !important;}
-      h2 {font-size: 1.15rem !important; margin: 0.3rem 0 !important;}
-      h3 {font-size: 1rem !important;    margin: 0.25rem 0 !important;}
+      h2 {font-size: 1.15rem !important; margin: 0.6rem 0 0.4rem !important;}
+      h3 {font-size: 1rem !important;    margin: 0.5rem 0 0.3rem !important;}
       .stMarkdown p {margin-bottom: 0.3rem;}
       [data-testid="stDownloadButton"] button {white-space: nowrap;}
+
+      /* Section separators: st.divider() gets a thicker, more visible
+         rule with breathing room on both sides so major sections
+         (Curves / Edit points / Downloads) don't visually collide. */
+      hr, [data-testid="stDivider"] hr {
+        border: 0 !important;
+        border-top: 2px solid #d0d4dc !important;
+        margin: 1.4rem 0 !important;
+      }
+      /* Extra padding around subheaders (st.subheader) so each block
+         reads as its own thing, not a run-on list. */
+      h2 + div, h3 + div {padding-top: 0.15rem;}
+      [data-testid="stSubheader"] {
+        padding-top: 0.6rem !important;
+        margin-bottom: 0.4rem !important;
+      }
+      /* Expanders as sections — give them a bit more air. */
+      div[data-testid="stExpander"] {
+        margin: 0.6rem 0 !important;
+      }
     </style>
     """, unsafe_allow_html=True)
 
@@ -2536,8 +3077,9 @@ def main():
     config = _render_sidebar()
     infer_module, chartdete_module = _load_models(config)
 
-    (tab_single, tab_pdf, tab_scatter, tab_sd, tab_vlm,
+    (tab_paper, tab_single, tab_pdf, tab_scatter, tab_sd, tab_vlm,
      tab_models) = st.tabs([
+        "📄 Paper → wpd-auto",
         "📈 Single Image",
         "📄 PDF Gallery",
         "⚫ Scatter",
@@ -2545,6 +3087,8 @@ def main():
         "✨ Claude + KMDS",
         "🧠 Models",
     ])
+    with tab_paper:
+        paper_to_wpda_tab(config)
     with tab_single:
         single_image_tab(infer_module, chartdete_module, config)
     with tab_pdf:

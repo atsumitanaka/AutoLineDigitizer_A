@@ -486,31 +486,84 @@ _MINERU_WEIGHTS = os.path.join("pp_doclayoutv2_weights", "models", "Layout",
                                "PP-DocLayoutV2")
 
 
+def _user_models_dir():
+    """Per-user model cache; survives .app upgrades (same scheme as LineFormer)."""
+    if sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library",
+                            "Application Support", "AutoLineDigitizer")
+    elif sys.platform == "win32":
+        base = os.path.join(os.environ.get("LOCALAPPDATA",
+                                            os.path.expanduser("~")),
+                            "AutoLineDigitizer")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".autolinedigitizer")
+    models_dir = os.path.join(base, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    return models_dir
+
+
 def _mineru_weights_dir():
-    # Weights may live under src/ (packaged layout) or the project root (dev
-    # checkout — the dir is gitignored and stayed at root after the src/ move).
+    """Return an existing weights dir; fall back to the user-data default.
+
+    Search order (first hit wins):
+      1. ~/Library/Application Support/AutoLineDigitizer/models/pp_doclayoutv2_weights/...
+         (runtime-downloaded, survives .app upgrades)
+      2. src/pp_doclayoutv2_weights/...        (dev checkout)
+      3. project_root/pp_doclayoutv2_weights/... (legacy)
+      4. bundled copy next to _MEIPASS/this file (pre-v0.9 .app layout)
+    """
     here = os.path.dirname(os.path.abspath(__file__))
-    for base in (here, os.path.dirname(here)):
-        cand = os.path.join(base, _MINERU_WEIGHTS)
-        if os.path.isdir(cand):
+    candidates = [
+        os.path.join(_user_models_dir(), _MINERU_WEIGHTS),
+        os.path.join(here, _MINERU_WEIGHTS),
+        os.path.join(os.path.dirname(here), _MINERU_WEIGHTS),
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand) and os.path.exists(
+                os.path.join(cand, "model.safetensors")):
             return cand
-    return os.path.join(here, _MINERU_WEIGHTS)
+    # Default to the user-data location (used when we're about to download).
+    return candidates[0]
+
+
+def _download_mineru_weights(progress_callback=None):
+    """Fetch PP-DocLayoutV2 weights into the user-data dir. Returns the path.
+
+    Behind the NIMS proxy: HTTPS_PROXY must be set in the env (see
+    feedback_nims_network.md). Errors propagate so the UI can surface them.
+    """
+    from huggingface_hub import snapshot_download
+    target_root = _user_models_dir()
+    if progress_callback is not None:
+        progress_callback("Downloading PP-DocLayoutV2 weights (~215 MB)…")
+    snapshot_download(
+        repo_id="opendatalab/PDF-Extract-Kit-1.0",
+        allow_patterns=["models/Layout/PP-DocLayoutV2/*"],
+        local_dir=os.path.join(target_root, "pp_doclayoutv2_weights"),
+    )
+    return _mineru_weights_dir()
 
 
 def mineru_available():
+    """True iff the Python packages exist. Weights are fetched on first use."""
     try:
         import mineru_layout  # noqa: F401
         import transformers   # noqa: F401
     except Exception:
         return False
-    wdir = _mineru_weights_dir()
-    return os.path.isdir(wdir) and os.path.exists(os.path.join(wdir, "model.safetensors"))
+    return True
 
 
-def _load_mineru(conf=0.45):
-    """Lazy-load + cache the PP-DocLayoutV2 ChartDetector (mps/cuda/cpu)."""
+def _load_mineru(conf=0.45, progress_callback=None):
+    """Lazy-load + cache the PP-DocLayoutV2 ChartDetector (mps/cuda/cpu).
+
+    Downloads the weights on first use if they aren't on disk yet.
+    """
     global _MINERU_DET
     if _MINERU_DET is None:
+        wdir = _mineru_weights_dir()
+        if not os.path.exists(os.path.join(wdir, "model.safetensors")):
+            wdir = _download_mineru_weights(progress_callback=progress_callback)
         import torch
         from mineru_layout import ChartDetector
         if torch.backends.mps.is_available():
@@ -520,7 +573,7 @@ def _load_mineru(conf=0.45):
         else:
             dev = "cpu"
         print(f"[mineru] loading PP-DocLayoutV2 on {dev} ...")
-        _MINERU_DET = ChartDetector(_mineru_weights_dir(), device=dev, conf=conf)
+        _MINERU_DET = ChartDetector(wdir, device=dev, conf=conf)
     return _MINERU_DET
 
 
